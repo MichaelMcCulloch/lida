@@ -24,7 +24,7 @@ class ChartScaffold(object):
 
         if library == "matplotlib":
             instructions = {
-                "role": "assistant",
+                "role": "system",
                 "content": f"  {matplotlib_instructions}. Use BaseMap for charts that require a map. "}
             template = \
                 f"""
@@ -40,7 +40,7 @@ def plot(data: pd.DataFrame):
 chart = plot(data) # data already contains the data to be plotted. Always include this line. No additional code beyond this line."""
         elif library == "seaborn":
             instructions = {
-                "role": "assistant",
+                "role": "system",
                 "content": f"{matplotlib_instructions}. Use BaseMap for charts that require a map. "}
 
             template = \
@@ -61,7 +61,7 @@ chart = plot(data) # data already contains the data to be plotted. Always includ
 
         elif library == "ggplot":
             instructions = {
-                "role": "assistant",
+                "role": "system",
                 "content": f"{general_instructions}. The plot method must return a ggplot object (chart)`. Think step by step.p. \n",
             }
 

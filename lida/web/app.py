@@ -227,6 +227,7 @@ async def generate_goal(req: GoalWebRequest) -> dict:
 @api.post("/summarize")
 async def upload_file(file: UploadFile):
     """ Upload a file and return a summary of the data """
+    
     # allow csv, excel, json
     allowed_types = ["text/csv", "application/vnd.ms-excel", "application/json"]
 
@@ -271,7 +272,6 @@ async def upload_file_via_url(req: SummaryUrlRequest) -> dict:
     url_response = requests.get(url, allow_redirects=True, timeout=1000)
     open(file_location, "wb").write(url_response.content)
     try:
-
         summary = lida.summarize(
             data=file_location,
             file_name=file_name,

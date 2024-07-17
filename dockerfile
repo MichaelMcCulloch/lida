@@ -8,11 +8,20 @@ ENV PYTHONBUFFERED 1
 # Set the working directory in the container 
 WORKDIR /app
 
-# Install requirements
-RUN pip install --no-cache-dir lida
+# Install git using apt cache
+RUN apt-get update && apt-get install -y git && apt-get clean
+
+# Copy the current directory contents into the container at /app
+COPY . /app
+
+# Install dependencies using pip cache
+RUN pip install -r requirements.txt
+
+# Install lida from the source in editable mode using pip cache
+RUN pip install -e .
 
 # Expose the port that the application will listen on 
 EXPOSE 8080
 
 # Start the Web UI
-CMD ["lida", "ui", "--host", "0.0.0.0", "--port", "8080", "--docs"]
+Entrypoint lida ui --host 0.0.0.0 --port 8080 --docs

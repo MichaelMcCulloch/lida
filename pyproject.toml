@@ -18,17 +18,17 @@ classifiers = [
 ]
 
 dependencies = [
-    "llmx>=0.0.21a",
+    "llmx@git+https://github.com/MichaelMcCulloch/llmx.git#egg=main",
     "pydantic",
     "uvicorn", 
     "typer",
     "fastapi", 
     "python-multipart", 
-     "scipy", 
+    "scipy", 
     "numpy",
     "pandas",
-    "matplotlib",
     "altair", 
+    "matplotlib",
     "seaborn",
     "plotly", 
     "plotnine",
