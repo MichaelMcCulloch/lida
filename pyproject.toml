@@ -18,7 +18,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "llmx@git+https://github.com/MichaelMcCulloch/llmx.git#egg=main",
+    "llmx@git+https://github.com/victordibia/llmx.git#egg=main",
     "pydantic",
     "uvicorn", 
     "typer",
