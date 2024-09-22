@@ -22,6 +22,7 @@ RUN pip install -e .
 
 # Expose the port that the application will listen on 
 EXPOSE 8080
+EXPOSE 8081
 
 # Start the Web UI
 Entrypoint lida ui --host 0.0.0.0 --port 8080 --docs
