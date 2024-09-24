@@ -1,4 +1,4 @@
-# LIDA: Automatic Generation of Visualizations and Infographics using Large Language Models
+# LIDA: Automatic Generation of Visualizations and Infographics using Large Language Models 📊
 
 [![PyPI version](https://badge.fury.io/py/lida.svg)](https://badge.fury.io/py/lida)
 [![arXiv](https://img.shields.io/badge/arXiv-2303.02927-<COLOR>.svg)](https://arxiv.org/abs/2303.02927)
