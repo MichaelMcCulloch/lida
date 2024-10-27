@@ -57,7 +57,7 @@ class Manager(object):
             config (TextGenerationConfig): Text generation configuration.
         """
         if config.provider is None:
-            config.provider = self.text_gen.provider or "openai"
+            config.provider = self.text_gen.provider or "anthropic"
             logger.info("Provider is not set, using default provider - %s", config.provider)
             return
 

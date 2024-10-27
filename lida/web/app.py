@@ -13,7 +13,7 @@ from ..components import Manager
 
 
 # instantiate model and generator
-textgen = llm()
+textgen = llm(provider="anthropic")
 logger = logging.getLogger("lida")
 api_docs = os.environ.get("LIDA_API_DOCS", "False") == "True"
 
@@ -307,4 +307,6 @@ async def generate_infographics(req: InfographicsRequest) -> dict:
 
 @api.get("/models")
 def list_models() -> dict:
+
+
     return {"status": True, "data": providers, "message": "Successfully listed models"}
