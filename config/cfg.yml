@@ -1,17 +1,27 @@
 # Sets the the default model to use for llm() when no provider parameter is set.
 model:
-  provider: anthropic
+  provider: google
   parameters:
     api_key: null
-
+    model: models/gemini-2.5-flash-lite-preview-09-2025
+    thinking_budget: 0
 providers:
-  anthropic:
-    name: anthropic
-    description: Anthropic's Claude models
+  google:
+    name: google
+    description: Google's Gemini models
     models:
-      - name: claude-3-5-sonnet-20241022
-        max_tokens: 8192
+      - name: Gemini 2.5 Flash Lite
+        max_tokens: 16384
         model:
-          provider: anthropic
+          provider: gemini
           parameters:
-            model: claude-3-5-sonnet-20241022
+            model: models/gemini-2.5-flash-lite-preview-09-2025
+            thinking_budget: 0
+      - name: Gemini 2.5 Flash
+        max_tokens: 16384
+        model:
+          provider: gemini
+          parameters:
+            model: models/gemini-2.5-flash
+            thinking_budget: 0
+
