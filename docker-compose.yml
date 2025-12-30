@@ -6,9 +6,9 @@ services:
     ports:
       - "8080:80"
     depends_on:
-      - backend
+      - lida-backend
 
-  backend:
+  lida-backend:
     build:
       context: .
       target: backend
