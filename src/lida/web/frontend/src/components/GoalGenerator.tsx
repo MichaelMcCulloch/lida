@@ -34,7 +34,7 @@ export const GoalGenerator: React.FC<GoalGeneratorProps> = ({ summary, onGoalSel
     const generateGoals = async () => {
         setLoading(true);
         try {
-            const res = await fetch('/api/goal', {
+            const res = await fetch('/api/v1/goal', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({

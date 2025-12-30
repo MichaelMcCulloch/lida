@@ -100,8 +100,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-api = FastAPI(root_path="/api", docs_url="/docs" if api_docs else None, redoc_url=None)
-app.mount("/api", api)
+api = FastAPI(root_path="/api/v1", docs_url="/docs" if api_docs else None, redoc_url=None)
+app.mount("/api/v1", api)
 
 
 root_file_path = os.path.dirname(os.path.abspath(__file__))

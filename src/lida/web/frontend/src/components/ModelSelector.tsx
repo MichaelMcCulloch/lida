@@ -27,7 +27,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({ onModelChange }) =
   const [loading, setLoading] = useState<boolean>(true);
 
   useEffect(() => {
-    fetch('/api/models')
+    fetch('/api/v1/models')
       .then((res) => res.json())
       .then((data: ModelsResponse) => {
         if (data.status) {

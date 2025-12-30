@@ -24,7 +24,7 @@ export const Visualizer: React.FC<VisualizerProps> = ({ summary, goal, library, 
             setLoading(true);
             setError('');
             try {
-                const res = await fetch('/api/visualize', {
+                const res = await fetch('/api/v1/visualize', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({

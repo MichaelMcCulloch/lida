@@ -29,7 +29,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
       // Append with .gz extension so backend knows it's compressed
       formData.append('file', compressedBlob, `${file.name}.gz`);
 
-      const res = await fetch('/api/summarize', {
+      const res = await fetch('/api/v1/summarize', {
         method: 'POST',
         body: formData,
       });
@@ -54,7 +54,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
 
     setLoading(true);
     try {
-        const res = await fetch('/api/summarize/url', {
+        const res = await fetch('/api/v1/summarize/url', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
