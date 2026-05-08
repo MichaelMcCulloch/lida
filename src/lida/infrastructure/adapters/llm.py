@@ -165,9 +165,7 @@ class GoalGenerator(IGoalGenerator):
         except json.decoder.JSONDecodeError:
             error_content = result.text[0]["content"]
             logger.error(f"Error decoding JSON from LLM response: {error_content}")
-            raise ValueError(
-                "The model did not return a valid JSON object while attempting generate goals. Consider using a larger model or a model with higher max token length."
-            )
+            raise ValueError("The model did not return a valid JSON object while attempting generate goals. Consider using a larger model or a model with higher max token length.")
         return goals
 
 
@@ -233,9 +231,7 @@ class VizEditor(IVizEditor):
         for i, instruction in enumerate(instructions):
             instruction_string += f"{i + 1}. {instruction} \n"
 
-        library_template, library_instructions = self.scaffold.get_template(
-            Goal(index=0, question="", visualization="", rationale=""), library
-        )
+        library_template, library_instructions = self.scaffold.get_template(Goal(index=0, question="", visualization="", rationale=""), library)
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_EDITOR},
@@ -277,9 +273,7 @@ class VizRepairer(IVizRepairer):
         library="altair",
     ):
         """Fix a code spec based on feedback"""
-        library_template, library_instructions = self.scaffold.get_template(
-            Goal(index=0, question="", visualization="", rationale=""), library
-        )
+        library_template, library_instructions = self.scaffold.get_template(Goal(index=0, question="", visualization="", rationale=""), library)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_REPAIRER},
             {
@@ -404,9 +398,7 @@ class VizRecommender(IVizRecommender):
     ):
         """Recommend a code spec based on existing visualization"""
 
-        library_template, library_instructions = self.scaffold.get_template(
-            Goal(index=0, question="", visualization="", rationale=""), library
-        )
+        library_template, library_instructions = self.scaffold.get_template(Goal(index=0, question="", visualization="", rationale=""), library)
 
         structure_instruction = f"""
         EACH CODE SNIPPET MUST BE A FULL PROGRAM (IT MUST IMPORT ALL THE LIBRARIES THAT ARE USED AND MUST CONTAIN plot(data) method). IT MUST FOLLOW THE STRUCTURE BELOW AND ONLY MODIFY THE INDICATED SECTIONS. \n\n {library_template} \n\n.
@@ -458,10 +450,7 @@ class PersonaGenerator(IPersonaGenerator):
 
         summary_dict = summary.__dict__
 
-        user_prompt = (
-            f"The number of PERSONAs to generate is {n}. Generate {n} personas in the right format given the data summary below,\n .\n"
-            f"{summary_dict} \n"
-        )
+        user_prompt = f"The number of PERSONAs to generate is {n}. Generate {n} personas in the right format given the data summary below,\n .\n{summary_dict} \n"
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_PERSONA},
@@ -479,7 +468,5 @@ class PersonaGenerator(IPersonaGenerator):
             personas = [Persona(**x) for x in result_json]
         except json.decoder.JSONDecodeError:
             logger.info(f"Error decoding JSON: {result.text[0]['content']}")
-            raise ValueError(
-                "The model did not return a valid JSON object while attempting generate personas. Consider using a larger model."
-            )
+            raise ValueError("The model did not return a valid JSON object while attempting generate personas. Consider using a larger model.")
         return personas

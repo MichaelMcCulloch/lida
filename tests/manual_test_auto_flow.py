@@ -36,13 +36,7 @@ def test_auto_viz_flow():
 
     # Mock enrichment response
     fields_json = '[{"column": "A", "properties": {"dtype": "number"}}, {"column": "B", "properties": {"dtype": "number"}}, {"column": "C", "properties": {"dtype": "number"}}, {"column": "Cat1", "properties": {"dtype": "string", "num_unique_values": 3}}, {"column": "Cat2", "properties": {"dtype": "string", "num_unique_values": 2}}]'
-    mock_text_gen.generate.return_value.text = [
-        {
-            "content": '{"dataset_description": "test data", "fields": '
-            + fields_json
-            + "} "
-        }
-    ]
+    mock_text_gen.generate.return_value.text = [{"content": '{"dataset_description": "test data", "fields": ' + fields_json + "} "}]
 
     lida = Manager(text_gen=mock_text_gen)
 
@@ -50,9 +44,7 @@ def test_auto_viz_flow():
     summary = lida.summarize("test_data.csv", summary_method="llm")
 
     # 2. Heuristic Goals
-    goals = lida.goals(
-        summary, n=50, method="heuristic"
-    )  # Request many to get all types
+    goals = lida.goals(summary, n=50, method="heuristic")  # Request many to get all types
     print(f"Goals generated: {len(goals)}")
 
     # Check for specific advanced types
@@ -80,24 +72,14 @@ def test_auto_viz_flow():
     assert has_stack
 
     # 3. Heuristic Viz & Execute (Sample one of each advanced type)
-    advanced_goals = [
-        g
-        for g in goals
-        if "bubble" in g.visualization
-        or "heatmap" in g.visualization
-        or "colored by" in g.visualization
-        or "grouped by" in g.visualization
-        or "stacked" in g.visualization
-    ]
+    advanced_goals = [g for g in goals if "bubble" in g.visualization or "heatmap" in g.visualization or "colored by" in g.visualization or "grouped by" in g.visualization or "stacked" in g.visualization]
 
     # Filter to unique types to test execution
     tested_types = set()
     for goal in advanced_goals:
         vtype = goal.visualization.split(" of ")[0]
         if vtype not in tested_types:
-            code_list = lida.visualize(
-                summary, goal, library="seaborn", method="heuristic"
-            )
+            code_list = lida.visualize(summary, goal, library="seaborn", method="heuristic")
             print(f"\nExecuting {vtype} for {goal.visualization}...")
             # print(code_list[0])
             executed = lida.execute(code_list, df, summary, library="seaborn")

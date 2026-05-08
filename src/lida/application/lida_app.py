@@ -340,9 +340,7 @@ class LidaApp:
             raise ValueError("PersonaGenerator adapter not initialized")
 
         self.check_textgen(config=textgen_config)
-        return self.persona_generator.generate(
-            summary=summary, text_gen=self.text_gen, textgen_config=textgen_config, n=n
-        )
+        return self.persona_generator.generate(summary=summary, text_gen=self.text_gen, textgen_config=textgen_config, n=n)
 
     def infographics(
         self,
@@ -358,9 +356,7 @@ class LidaApp:
             # If it's optional, we raise or info user.
             # The Manager handled the import error.
             # LidaApp should just assume it's supplied or fail.
-            raise ValueError(
-                "InfographicsGenerator adapter not initialized. Please ensure lida[infographics] is installed and configured."
-            )
+            raise ValueError("InfographicsGenerator adapter not initialized. Please ensure lida[infographics] is installed and configured.")
 
         # No textgen check needed for image gen usually, unless it uses prompts?
         # The style_prompt is passed.

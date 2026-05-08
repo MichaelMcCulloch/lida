@@ -70,7 +70,5 @@ class GoalExplorer:
         except json.decoder.JSONDecodeError:
             error_content = result.text[0]["content"]
             logger.error(f"Error decoding JSON from LLM response: {error_content}")
-            raise ValueError(
-                "The model did not return a valid JSON object while attempting generate goals. Consider using a larger model or a model with higher max token length."
-            )
+            raise ValueError("The model did not return a valid JSON object while attempting generate goals. Consider using a larger model or a model with higher max token length.")
         return result

@@ -56,7 +56,5 @@ class PersonaExplorer:
         except json.decoder.JSONDecodeError:
             logger.info(f"Error decoding JSON: {result.text[0]['content']}")
             print(f"Error decoding JSON: {result.text[0]['content']}")
-            raise ValueError(
-                "The model did not return a valid JSON object while attempting generate personas.  Consider using a larger model or a model with higher max token length."
-            )
+            raise ValueError("The model did not return a valid JSON object while attempting generate personas.  Consider using a larger model or a model with higher max token length.")
         return result

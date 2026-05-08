@@ -4,7 +4,6 @@ import requests
 import traceback
 import multiprocessing
 import matplotlib
-import yaml
 
 matplotlib.use("Agg")  # Ensure headless execution
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -12,10 +11,9 @@ from fastapi import FastAPI, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from lida.utils import get_provider_preference, read_dataframe
+from lida.utils import read_dataframe
 
-from llmx import llm, providers
-from ..components.gemini_generator import GeminiTextGenerator
+from ..components.litellm_generator import LiteLLMTextGenerator
 from ..datamodel import (
     GoalWebRequest,
     SummaryUrlRequest,
@@ -31,58 +29,12 @@ from ..datamodel import (
 from ..components import Manager
 
 
-# instantiate model and generator
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lida")
-selected_provider = get_provider_preference()
-provider_key = None
-if selected_provider == "google":
-    provider_key = (
-        os.environ.get("PALM_API_KEY") or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    )
-elif selected_provider == "openai":
-    provider_key = os.environ.get("OPENAI_API_KEY")
-elif selected_provider == "anthropic":
-    provider_key = os.environ.get("ANTHROPIC_API_KEY")
 
-if selected_provider == "gemini" or selected_provider == "google":
-    # Use custom Gemini generator
-    # Try to load model from config
-    model_name = None
-    config_path = os.environ.get("LLMX_CONFIG_PATH", "config/cfg.yml")
-    if os.path.exists(config_path):
-        try:
-            print(f"DEBUG: Loading config from {config_path}", flush=True)
-            with open(config_path, "r") as f:
-                config = yaml.safe_load(f)
-                # Check default model config first (preferred)
-                print(
-                    f"DEBUG: Config model provider: {config.get('model', {}).get('provider')}, Selected: {selected_provider}",
-                    flush=True,
-                )
-                if selected_provider == config.get("model", {}).get("provider"):
-                    model_name = config.get("model", {}).get("parameters", {}).get("model")
-                    print(
-                        f"DEBUG: Found model in default config: {model_name}",
-                        flush=True,
-                    )
+textgen = LiteLLMTextGenerator()
+logger.info("Initialized LiteLLMTextGenerator base_url=%s model=%s", textgen.base_url, textgen.model_name)
 
-                # Check specific provider config if default didn't match or wasn't set
-                if not model_name and "providers" in config and selected_provider in config["providers"]:
-                    # This part depends on how llmx structurs provider specific configs which might be complex
-                    # For now, relying on the 'model' block is safer given the cfg.yml I saw
-                    pass
-        except Exception as e:
-            logger.error(f"Failed to load config from {config_path}: {e}")
-            print(f"DEBUG: Config load error: {e}", flush=True)
-
-    textgen = GeminiTextGenerator(provider=selected_provider, api_key=provider_key, model=model_name)
-    print(
-        f"DEBUG: Initialized GeminiTextGenerator with model: {textgen.model_name}",
-        flush=True,
-    )
-else:
-    textgen = llm(provider=selected_provider, api_key=provider_key)
 api_docs = os.environ.get("LIDA_API_DOCS", "False") == "True"
 
 
@@ -129,38 +81,6 @@ else:
 api.mount("/files", StaticFiles(directory=files_static_root, html=True), name="files")
 
 
-def handle_provider_fallback(config: TextGenerationConfig) -> TextGenerationConfig:
-    """If the UI requests a provider without a key, fall back to the default."""
-    # This is a workaround for the UI defaulting to Anthropic
-    # This is a workaround for the UI defaulting to Anthropic
-    if config.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
-        default_provider = get_provider_preference()
-        logger.warning(
-            f"Anthropic provider selected by UI but no key found. Switching to default provider: {default_provider}"
-        )
-        config.provider = default_provider
-        config.model = None
-        config.model = None  # Clear model to allow default for new provider
-    elif (config.provider == "google" or config.provider == "gemini") and not (
-        os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    ):
-        default_provider = get_provider_preference()
-        logger.warning(
-            f"Google provider selected by UI but no key found. Switching to default provider: {default_provider}"
-        )
-        config.provider = default_provider
-        config.model = None
-    elif config.provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        default_provider = get_provider_preference()
-        logger.warning(
-            f"OpenAI provider selected by UI but no key found. Switching to default provider: {default_provider}"
-        )
-        config.provider = default_provider
-        config.model = None
-
-    return config
-
-
 def execute_chart_worker(code, data_df, summary, library):
     """Worker function for executing charts in a separate process"""
     # Import locally to avoid pickling issues if global imports are complex,
@@ -184,7 +104,6 @@ async def visualize_data(req: VisualizeWebRequest) -> dict:
     )
     try:
         textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig()
-        textgen_config = handle_provider_fallback(textgen_config)
 
         # Load data if library is not altair (which uses URL reference)
         data = None
@@ -230,7 +149,6 @@ async def edit_visualization(req: VisualizeEditWebRequest) -> dict:
     """Given a visualization code, and a goal, generate a new visualization"""
     try:
         textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig()
-        textgen_config = handle_provider_fallback(textgen_config)
         charts = lida.edit(
             code=req.code,
             summary=req.summary,
@@ -260,7 +178,6 @@ async def repair_visualization(req: VisualizeRepairWebRequest) -> dict:
 
     try:
         textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig()
-        textgen_config = handle_provider_fallback(textgen_config)
         charts = lida.repair(
             code=req.code,
             feedback=req.feedback,
@@ -288,7 +205,6 @@ async def repair_visualization(req: VisualizeRepairWebRequest) -> dict:
 async def explain_visualization(req: VisualizeExplainWebRequest) -> dict:
     """Given a visualization code, provide an explanation of the code"""
     textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig(n=1, temperature=0)
-    textgen_config = handle_provider_fallback(textgen_config)
     try:
         explanations = lida.explain(code=req.code, textgen_config=textgen_config, library=req.library)
         return {
@@ -311,7 +227,6 @@ async def evaluate_visualization(req: VisualizeEvalWebRequest) -> dict:
 
     try:
         textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig(n=1, temperature=0)
-        textgen_config = handle_provider_fallback(textgen_config)
         evaluations = lida.evaluate(
             code=req.code,
             goal=req.goal,
@@ -338,7 +253,6 @@ async def recommend_visualization(req: VisualizeRecommendRequest) -> dict:
 
     try:
         textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig()
-        textgen_config = handle_provider_fallback(textgen_config)
         charts = lida.recommend(
             summary=req.summary,
             code=req.code,
@@ -368,7 +282,6 @@ async def generate_text(textgen_config: TextGenerationConfig) -> dict:
     """Generate text given some prompt"""
 
     try:
-        textgen_config = handle_provider_fallback(textgen_config)
         completions = textgen.generate(textgen_config)
         return {"status": True, "completions": completions.text}
     except Exception as exception_error:
@@ -381,7 +294,6 @@ async def generate_goal(req: GoalWebRequest) -> dict:
     """Generate goals given a dataset summary"""
     try:
         textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig()
-        textgen_config = handle_provider_fallback(textgen_config)
         goals = lida.goals(req.summary, n=req.n, textgen_config=textgen_config, method=req.method)
         return {
             "status": True,
@@ -428,7 +340,6 @@ async def upload_file(
 
         # summarize
         textgen_config = TextGenerationConfig(n=1, temperature=0)
-        textgen_config = handle_provider_fallback(textgen_config)
         summary = lida.summarize(
             data=file_location,
             file_name=file.filename,
@@ -479,10 +390,7 @@ async def upload_file(
                     ctx = multiprocessing.get_context("spawn")
                     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
                         # Map futures to their index to maintain order if needed, or just collect
-                        future_to_index = {
-                            executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal)
-                            for i, goal, code in goals_with_code
-                        }
+                        future_to_index = {executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal) for i, goal, code in goals_with_code}
 
                         # Collect results as they complete
                         metrics_executed = 0
@@ -549,7 +457,6 @@ async def upload_file_via_url(req: SummaryUrlRequest) -> dict:
     """Upload a file from a url and return a summary of the data"""
     url = req.url
     textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig(n=1, temperature=0)
-    textgen_config = handle_provider_fallback(textgen_config)
     file_name = url.split("/")[-1]
     file_location = os.path.join(data_folder, file_name)
 
@@ -632,15 +539,18 @@ async def generate_infographics(req: InfographicsRequest) -> dict:
         }
 
 
-# list supported models
-
-
 @api.get("/models")
 def list_models() -> dict:
-    preference = get_provider_preference()
     return {
         "status": True,
-        "data": providers,
-        "default": preference,
+        "data": {
+            "litellm": {
+                "name": "litellm",
+                "description": "LiteLLM proxy (OpenAI-compatible)",
+                "base_url": textgen.base_url,
+                "models": [{"name": textgen.model_name}],
+            }
+        },
+        "default": "litellm",
         "message": "Successfully listed models",
     }

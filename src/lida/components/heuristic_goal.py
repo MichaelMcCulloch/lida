@@ -152,10 +152,7 @@ class HeuristicGoalExplorer:
         if len(categorical_fields) >= 2:
             cat1 = categorical_fields[0]["column"]
             cat2 = categorical_fields[1]["column"]
-            if (
-                categorical_fields[0]["properties"].get("num_unique_values", 100) < 20
-                and categorical_fields[1]["properties"].get("num_unique_values", 100) < 10
-            ):
+            if categorical_fields[0]["properties"].get("num_unique_values", 100) < 20 and categorical_fields[1]["properties"].get("num_unique_values", 100) < 10:
                 goals.append(
                     Goal(
                         question=f"Count of {cat1} stacked by {cat2}?",

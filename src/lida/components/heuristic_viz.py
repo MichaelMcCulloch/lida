@@ -16,9 +16,7 @@ class HeuristicVizGenerator:
 
         # We only support seaborn for now as it's the most robust for this
         if library != "seaborn":
-            logger.warning(
-                f"Heuristic mode only works best with seaborn, but {library} was requested. Defaulting to seaborn-like structure."
-            )
+            logger.warning(f"Heuristic mode only works best with seaborn, but {library} was requested. Defaulting to seaborn-like structure.")
 
         viz_type = goal.visualization
         code = ""

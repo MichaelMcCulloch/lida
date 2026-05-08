@@ -45,9 +45,7 @@ class Infographer(IInfographicsGenerator):
                 visualization, _ = base64_to_pil(visualization)
             except Exception as pil_exception:
                 logger.error(pil_exception)
-                raise ValueError(
-                    f"Could not convert provided visualization to PIL image, {str(pil_exception)}"
-                ) from pil_exception
+                raise ValueError(f"Could not convert provided visualization to PIL image, {str(pil_exception)}") from pil_exception
 
         if self.model is None:
             self.load_model()

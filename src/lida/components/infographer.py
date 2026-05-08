@@ -14,9 +14,7 @@ class Infographer:
 
     def __init__(self, model_config: ModelConfig = None) -> None:
         self.model = None
-        self.model_config = model_config or ModelConfig(
-            device="cuda", model="runwayml/stable-diffusion-v1-5", revision="main"
-        )
+        self.model_config = model_config or ModelConfig(device="cuda", model="runwayml/stable-diffusion-v1-5", revision="main")
 
     def load_model(self) -> None:
         """Load image generator model from config"""
@@ -36,9 +34,7 @@ class Infographer:
                 visualization, _ = base64_to_pil(visualization)
             except Exception as pil_exception:
                 logger.error(pil_exception)
-                raise ValueError(
-                    f"Could not convert provided visualization to PIL image, {str(pil_exception)}"
-                ) from pil_exception
+                raise ValueError(f"Could not convert provided visualization to PIL image, {str(pil_exception)}") from pil_exception
             self.load_model()
 
         gen_config = GeneratorConfig(

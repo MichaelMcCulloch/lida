@@ -271,6 +271,4 @@ class ChartExecutorAdapter(IChartExecutor):
             return charts
 
         else:
-            raise ValueError(
-                f"Unsupported library. Supported libraries are altair, matplotlib, seaborn, ggplot, plotly. You provided {library}"
-            )
+            raise ValueError(f"Unsupported library. Supported libraries are altair, matplotlib, seaborn, ggplot, plotly. You provided {library}")

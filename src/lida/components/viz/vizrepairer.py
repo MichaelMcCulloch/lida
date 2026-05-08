@@ -30,9 +30,7 @@ class VizRepairer(object):
         library="altair",
     ):
         """Fix a code spec based on feedback"""
-        library_template, library_instructions = self.scaffold.get_template(
-            Goal(index=0, question="", visualization="", rationale=""), library
-        )
+        library_template, library_instructions = self.scaffold.get_template(Goal(index=0, question="", visualization="", rationale=""), library)
         messages = [
             {"role": "system", "content": system_prompt},
             {

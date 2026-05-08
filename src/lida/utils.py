@@ -13,90 +13,8 @@ logger = logging.getLogger("lida")
 
 
 def adapt_messages_for_provider(messages: List[Dict[str, str]], provider: str) -> List[Dict[str, str]]:
-    """Adapts the message structure for a specific LLM provider."""
-    if provider == "gemini" or provider == "google":
-        return _adapt_for_gemini(messages)
+    """Pass-through retained for adapter call sites; LiteLLM proxy speaks OpenAI format."""
     return messages
-
-
-def get_provider_preference() -> str:
-    """
-    Determine local preference for LLM provider based on available keys.
-    Preference: Gemini (google) > OpenAI > Anthropic
-    """
-    # Ensure GEMINI_API_KEY is mapped to GOOGLE_API_KEY if needed by libraries
-    google_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if google_key:
-        if not os.environ.get("GOOGLE_API_KEY"):
-            os.environ["GOOGLE_API_KEY"] = google_key
-        # llmx's google/palm provider often requires PALM_API_KEY
-        if not os.environ.get("PALM_API_KEY"):
-            os.environ["PALM_API_KEY"] = google_key
-        return "google"
-
-    elif os.environ.get("OPENAI_API_KEY"):
-        return "openai"
-    elif os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    return "openai"  # Default fallback
-
-
-def _adapt_for_gemini(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Converts a list of messages to Gemini's required format:
-    - No system prompts.
-    - Roles must be 'user' and 'model'.
-    - Must start with a 'user' role.
-    - Roles must alternate.
-    """
-    # 1. Consolidate all content into a list of (role, content) tuples, mapping roles.
-    content_tuples = []
-    system_content = []
-    for msg in messages:
-        if not msg.get("content") or not msg.get("content").strip():
-            continue  # Skip messages with no content
-        if msg["role"] == "system":
-            system_content.append(msg["content"])
-        elif msg["role"] == "user":
-            content_tuples.append(("user", msg["content"]))
-        elif msg["role"] == "assistant":
-            content_tuples.append(("model", msg["content"]))
-
-    # 2. Prepend system prompt to the first content item.
-    if system_content:
-        full_system_prompt = "\n\n".join(system_content)
-        if content_tuples:
-            first_role, first_content = content_tuples[0]
-            content_tuples[0] = (first_role, f"{full_system_prompt}\n\n{first_content}")
-        else:
-            content_tuples.append(("user", full_system_prompt))
-
-    if not content_tuples:
-        return []
-
-    # 3. Merge consecutive messages of the same role.
-    merged_tuples = []
-    for role, content in content_tuples:
-        if merged_tuples and merged_tuples[-1][0] == role:
-            merged_tuples[-1] = (role, f"{merged_tuples[-1][1]}\n\n{content}")
-        else:
-            merged_tuples.append((role, content))
-
-    # 4. Ensure the conversation starts with a 'user' role.
-    if merged_tuples and merged_tuples[0][0] == "model":
-        first_model_content = merged_tuples.pop(0)[1]
-        if merged_tuples and merged_tuples[0][0] == "user":
-            merged_tuples[0] = (
-                "user",
-                f"{first_model_content}\n\n{merged_tuples[0][1]}",
-            )
-        else:
-            merged_tuples.insert(0, ("user", first_model_content))
-
-    # 5. Build the final list of dicts.
-    adapted_messages = [{"role": role, "content": content} for role, content in merged_tuples]
-
-    return adapted_messages
 
 
 def get_dirs(path: str) -> List[str]:
@@ -218,9 +136,7 @@ def plot_raster(rasters: Union[str, List[str]], figsize: Tuple[int, int] = (10, 
 
         aspect_ratio = image.shape[1] / image.shape[0]
         new_width = int(max_height * aspect_ratio)
-        image_resized = np.array(
-            [np.interp(np.linspace(0, len(row), new_width), np.arange(0, len(row)), row) for row in image]
-        )
+        image_resized = np.array([np.interp(np.linspace(0, len(row), new_width), np.arange(0, len(row)), row) for row in image])
 
         if image_resized.shape[2] == 4:  # If RGBA, preserve alpha channel
             alpha_channel = image_resized[:, :, 3:]
@@ -258,9 +174,6 @@ def num_tokens_from_messages(messages, model="gpt-3.5-turbo-0301"):
         return num_tokens
     else:
         raise NotImplementedError(f"""num_tokens_from_messages() is not presently implemented for model {model}.""")
-
-
-
 
 
 def clean_code_snippet(code_string):

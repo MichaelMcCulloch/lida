@@ -265,6 +265,4 @@ class ChartExecutor(IChartExecutor):
             return charts
 
         else:
-            raise Exception(
-                f"Unsupported library. Supported libraries are altair, matplotlib, seaborn, ggplot, plotly. You provided {library}"
-            )
+            raise Exception(f"Unsupported library. Supported libraries are altair, matplotlib, seaborn, ggplot, plotly. You provided {library}")

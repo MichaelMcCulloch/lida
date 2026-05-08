@@ -80,11 +80,7 @@ def verify_flow():
     # Mock TextGenerator in adapters
     mock_text_gen = MagicMock()
     # Mock generation for Goal
-    mock_text_gen.generate.return_value.text = [
-        {
-            "content": '[{"index": 0, "question": "q", "visualization": "v", "rationale": "r"}]'
-        }
-    ]
+    mock_text_gen.generate.return_value.text = [{"content": '[{"index": 0, "question": "q", "visualization": "v", "rationale": "r"}]'}]
 
     lida = Manager(text_gen=mock_text_gen)
     # Inject behavior for VizGenerator (returns code)
@@ -102,11 +98,7 @@ def verify_flow():
     goal = Goal(question="q", visualization="v", rationale="r")
 
     # Mock VizGeneratorAdapter.generate to return code
-    lida.viz_generator_adapter.generate = MagicMock(
-        return_value=[
-            "import matplotlib.pyplot as plt\ndef plot(data):\n    return plt\nchart = plot(data)"
-        ]
-    )
+    lida.viz_generator_adapter.generate = MagicMock(return_value=["import matplotlib.pyplot as plt\ndef plot(data):\n    return plt\nchart = plot(data)"])
 
     # Run visualize
     charts = lida.visualize(summary=summary, goal=goal, library="seaborn")

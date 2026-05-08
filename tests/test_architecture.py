@@ -52,6 +52,4 @@ def test_application_layer_independence():
                 imports = get_imports(file_path)
                 for imp in imports:
                     if "lida.infrastructure" in imp:
-                        pytest.fail(
-                            f"Application layer file {file} imports infrastructure: {imp}"
-                        )
+                        pytest.fail(f"Application layer file {file} imports infrastructure: {imp}")

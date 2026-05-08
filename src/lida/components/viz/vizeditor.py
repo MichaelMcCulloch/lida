@@ -32,9 +32,7 @@ class VizEditor(object):
         for i, instruction in enumerate(instructions):
             instruction_string += f"{i + 1}. {instruction} \n"
 
-        library_template, library_instructions = self.scaffold.get_template(
-            Goal(index=0, question="", visualization="", rationale=""), library
-        )
+        library_template, library_instructions = self.scaffold.get_template(Goal(index=0, question="", visualization="", rationale=""), library)
         # print("instructions", instructions)
 
         messages = [

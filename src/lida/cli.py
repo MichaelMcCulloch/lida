@@ -2,9 +2,8 @@ import typer
 import uvicorn
 import os
 from typing_extensions import Annotated
-from llmx import providers
 
-# from lida.web.backend.app import launch
+from lida.components.litellm_generator import DEFAULT_BASE_URL, DEFAULT_MODEL
 
 app = typer.Typer()
 
@@ -18,23 +17,11 @@ def ui(
     docs: bool = False,
 ):
     """
-    Launch the lida .Pass in parameters host, port, workers, and reload to override the default values.
+    Launch the lida UI. The LLM endpoint is a LiteLLM proxy configured via
+    LITELLM_BASE_URL, LITELLM_API_KEY, and LITELLM_MODEL environment variables.
     """
 
     os.environ["LIDA_API_DOCS"] = str(docs)
-
-    # Set the config path for llmx
-    config_path = os.path.join(os.path.dirname(__file__), "..", "config", "cfg.yml")
-    if os.path.exists(config_path):
-        os.environ["LLMX_CONFIG_PATH"] = config_path
-    else:
-        # Fallback for when running from a different context
-        # Assumes a standard project structure where config is at the root
-        alt_config_path = "config/cfg.yml"
-        if os.path.exists(alt_config_path):
-            os.environ["LLMX_CONFIG_PATH"] = alt_config_path
-        else:
-            print("Warning: Could not find cfg.yml. The application may default to an unexpected LLM provider.")
 
     uvicorn.run(
         "lida.web.app:app",
@@ -47,11 +34,11 @@ def ui(
 
 @app.command()
 def models():
-    print("A list of supported providers:")
-    for provider in providers.items():
-        print(f"Provider: {provider[1]['name']}")
-        for model in provider[1]["models"]:
-            print(f"  - {model['name']}")
+    """Print the active LiteLLM endpoint and default model."""
+    base_url = os.environ.get("LITELLM_BASE_URL") or DEFAULT_BASE_URL
+    model = os.environ.get("LITELLM_MODEL") or DEFAULT_MODEL
+    print(f"Provider: litellm ({base_url})")
+    print(f"  - {model}")
 
 
 def run():

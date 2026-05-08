@@ -57,9 +57,7 @@ class VizRecommender(object):
     ):
         """Recommend a code spec based on existing visualization"""
 
-        library_template, library_instructions = self.scaffold.get_template(
-            Goal(index=0, question="", visualization="", rationale=""), library
-        )
+        library_template, library_instructions = self.scaffold.get_template(Goal(index=0, question="", visualization="", rationale=""), library)
 
         structure_instruction = f"""
         EACH CODE SNIPPET MUST BE A FULL PROGRAM (IT MUST IMPORT ALL THE LIBRARIES THAT ARE USED AND MUST CONTAIN plot(data) method). IT MUST FOLLOW THE STRUCTURE BELOW AND ONLY MODIFY THE INDICATED SECTIONS. \n\n {library_template} \n\n.

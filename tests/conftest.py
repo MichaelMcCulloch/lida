@@ -11,11 +11,7 @@ def pytest_configure(config):
         system_content = messages[0]["content"] if messages else ""
 
         # Decide what to return based on prompt
-        if (
-            "Annotation" in system_content
-            or "Annotate the dictionary" in str(messages)
-            or "updated JSON dictionary" in system_content
-        ):
+        if "Annotation" in system_content or "Annotate the dictionary" in str(messages) or "updated JSON dictionary" in system_content:
             # Summarizer expects a dict
             content_data = {
                 "name": "mock_data.csv",
@@ -26,9 +22,7 @@ def pytest_configure(config):
             }
             content = json.dumps(content_data)
             mock_resp = MagicMock()
-            mock_resp.text = [
-                {"content": "```json\n" + content + "\n```", "role": "assistant"}
-            ]
+            mock_resp.text = [{"content": "```json\n" + content + "\n```", "role": "assistant"}]
             return mock_resp
         elif "PERFECT code" in system_content:
             # VizGenerator expects code
@@ -43,9 +37,7 @@ def plot(data):
 chart = plot(data)
 """
             mock_resp = MagicMock()
-            mock_resp.text = [
-                {"content": "```python\n" + content + "\n```", "role": "assistant"}
-            ]
+            mock_resp.text = [{"content": "```python\n" + content + "\n```", "role": "assistant"}]
             return mock_resp
         else:
             # Default to List (Goals, Personas, etc.)
@@ -69,9 +61,7 @@ chart = plot(data)
 
             mock_resp = MagicMock()
             # Lida utils cleans code snippet looking for backticks
-            mock_resp.text = [
-                {"content": "```json\n" + content + "\n```", "role": "assistant"}
-            ]
+            mock_resp.text = [{"content": "```json\n" + content + "\n```", "role": "assistant"}]
             return mock_resp
 
     mock_llm_instance.generate.side_effect = generate_side_effect

@@ -102,8 +102,6 @@ chart = plot(data) # variable data already contains the data to be plotted and s
 """
 
         else:
-            raise ValueError(
-                "Unsupported library. Choose from 'matplotlib', 'seaborn', 'plotly', 'bokeh', 'ggplot', 'altair'."
-            )
+            raise ValueError("Unsupported library. Choose from 'matplotlib', 'seaborn', 'plotly', 'bokeh', 'ggplot', 'altair'.")
 
         return template, instructions

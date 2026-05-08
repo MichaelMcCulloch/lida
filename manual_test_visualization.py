@@ -50,9 +50,7 @@ def test_visualization():
         print("Requesting visualization...")
         res_viz = requests.post("http://localhost:8080/api/visualize", json=payload)
         print(f"Visualize Response Code: {res_viz.status_code}")
-        print(
-            f"Visualize Response Body: {res_viz.text[:500]}..."
-        )  # Print first 500 chars
+        print(f"Visualize Response Body: {res_viz.text[:500]}...")  # Print first 500 chars
 
     except Exception as e:
         print(f"Error: {e}")

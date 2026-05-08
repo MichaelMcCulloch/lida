@@ -1,10 +1,11 @@
 import logging
 from typing import List, Union
 import pandas as pd
-from llmx import llm, TextGenerator, TextGenerationConfig
+from llmx import TextGenerator, TextGenerationConfig
 
 from lida.domain.models import Goal, Summary, Persona
 from lida.application.services import LidaApplication
+from lida.components.litellm_generator import LiteLLMTextGenerator
 from lida.infrastructure.adapters.summarizer import SummarizerAdapter
 from lida.infrastructure.adapters.goal import GoalGeneratorAdapter
 from lida.infrastructure.adapters.executor import ChartExecutorAdapter
@@ -25,7 +26,7 @@ class Manager(object):
             text_gen (TextGenerator, optional): Text generator object. Defaults to None.
         """
 
-        self.text_gen = text_gen or llm()
+        self.text_gen = text_gen or LiteLLMTextGenerator()
 
         # Instantiate adapters with dependencies
         self.summarizer_adapter = SummarizerAdapter(text_gen=self.text_gen)

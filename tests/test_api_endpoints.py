@@ -17,18 +17,10 @@ def mock_lida():
     with patch("lida.web.app.lida") as mock:
         # Configuration matches what api expects
         # Visualization
-        mock.visualize.return_value = [
-            {"raster": "base64encoded", "spec": {}, "status": True}
-        ]
-        mock.edit.return_value = [
-            {"raster": "base64encoded", "spec": {}, "status": True}
-        ]
-        mock.repair.return_value = [
-            {"raster": "base64encoded", "spec": {}, "status": True}
-        ]
-        mock.recommend.return_value = [
-            {"raster": "base64encoded", "spec": {}, "status": True}
-        ]
+        mock.visualize.return_value = [{"raster": "base64encoded", "spec": {}, "status": True}]
+        mock.edit.return_value = [{"raster": "base64encoded", "spec": {}, "status": True}]
+        mock.repair.return_value = [{"raster": "base64encoded", "spec": {}, "status": True}]
+        mock.recommend.return_value = [{"raster": "base64encoded", "spec": {}, "status": True}]
 
         # Explanation
         mock.explain.return_value = [[{"section": "overview", "text": "explanation"}]]
@@ -284,9 +276,7 @@ def test_summarize_upload(tmp_path, mock_lida):
 
     with open(d, "rb") as f:
         # The endpoint expects 'file' in multipart/form-data
-        response = client.post(
-            "/api/summarize", files={"file": ("data.csv", f, "text/csv")}
-        )
+        response = client.post("/api/summarize", files={"file": ("data.csv", f, "text/csv")})
 
     assert response.status_code == 200
     data = response.json()
