@@ -3,6 +3,7 @@ import os
 import logging
 import requests
 import shutil
+import tarfile
 import traceback
 import multiprocessing
 import matplotlib
@@ -13,7 +14,7 @@ from fastapi import FastAPI, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from lida.utils import is_sqlite_file, read_dataframe, read_sqlite_tables
+from lida.utils import is_gzip_file, is_sqlite_file, is_tar_archive, read_dataframe, read_sqlite_tables
 
 from ..components.litellm_generator import LiteLLMTextGenerator
 from ..datamodel import (
@@ -391,19 +392,25 @@ async def upload_file(
     """
 
     try:
-        saved_path = os.path.join(data_folder, file.filename)
+        saved_path = os.path.join(data_folder, file.filename or "upload.bin")
         with open(saved_path, "wb+") as file_object:
             file_object.write(file.file.read())
 
-        file_location, display_name = _decompress_if_gzipped(saved_path, file.filename)
+        file_location, display_name = _decompress_if_gzipped(saved_path, file.filename or "upload.bin")
 
         textgen_config = TextGenerationConfig(n=1, temperature=0)
+        entries = _process_uploaded_file(file_location, display_name, textgen_config, visualize)
 
-        if is_sqlite_file(file_location):
-            return _summarize_sqlite(file_location, display_name, textgen_config, visualize)
-
-        result = summarize_and_visualize(file_location, display_name, textgen_config, visualize)
-        return {"status": True, **result}
+        if not entries:
+            return {"status": False, "message": "No tabular data found in upload."}
+        if len(entries) == 1 and "table_name" not in entries[0]:
+            return {"status": True, **entries[0]}
+        return {
+            "status": True,
+            "is_database": True,
+            "data_filename": display_name,
+            "tables": entries,
+        }
     except Exception as exception_error:
         logger.error(f"Error processing file: {str(exception_error)}")
         logger.debug(traceback.format_exc())
@@ -411,17 +418,24 @@ async def upload_file(
 
 
 def _decompress_if_gzipped(saved_path: str, original_filename: str) -> tuple[str, str]:
-    """If the uploaded file is gzip-wrapped, materialize the inner file alongside it.
+    """If the uploaded file is gzip-wrapped (detected by magic bytes), unwrap it.
 
-    Returns (canonical_path, canonical_filename). The original .gz is removed so
-    downstream callers see the un-wrapped file, which is required for SQLite magic
-    detection and avoids confusion in `summary.file_name`.
+    Returns (canonical_path, canonical_filename). The wrapped file is removed so
+    downstream callers see the unwrapped file. ``.tgz`` is mapped to ``.tar``.
     """
-    if not original_filename.lower().endswith(".gz"):
+    if not is_gzip_file(saved_path):
         return saved_path, original_filename
-    inner_name = original_filename[:-3]
+
+    lower = original_filename.lower()
+    if lower.endswith(".tgz"):
+        inner_name = original_filename[:-4] + ".tar"
+    elif lower.endswith(".gz"):
+        inner_name = original_filename[:-3]
+    else:
+        inner_name = original_filename + ".out"
     if not inner_name:
         return saved_path, original_filename
+
     inner_path = os.path.join(data_folder, inner_name)
     with gzip.open(saved_path, "rb") as src, open(inner_path, "wb") as dst:
         shutil.copyfileobj(src, dst)
@@ -432,28 +446,61 @@ def _decompress_if_gzipped(saved_path: str, original_filename: str) -> tuple[str
     return inner_path, inner_name
 
 
-def _summarize_sqlite(file_location: str, db_filename: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> dict:
+def _process_uploaded_file(file_location: str, display_name: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> list:
+    """Dispatch on file kind, returning a flat list of per-dataset result dicts."""
+    if is_sqlite_file(file_location):
+        return _sqlite_entries(file_location, display_name, textgen_config, run_visualize)
+    if is_tar_archive(file_location):
+        return _tar_entries(file_location, display_name, textgen_config, run_visualize)
+    return [summarize_and_visualize(file_location, display_name, textgen_config, run_visualize)]
+
+
+def _sqlite_entries(file_location: str, db_filename: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> list:
     """Materialize each user table as a CSV, then run the standard pipeline per table."""
     tables = read_sqlite_tables(file_location)
     if not tables:
-        return {"status": False, "message": "No user tables found in the database."}
-
+        return []
     stem, _ = os.path.splitext(db_filename)
-    table_results: list = []
+    results: list = []
     for table_name, df in tables.items():
         csv_filename = f"{stem}__{table_name}.csv"
         csv_path = os.path.join(data_folder, csv_filename)
         df.to_csv(csv_path, index=False)
         per_table = summarize_and_visualize(csv_path, csv_filename, textgen_config, run_visualize)
         per_table["table_name"] = table_name
-        table_results.append(per_table)
+        results.append(per_table)
+    return results
 
-    return {
-        "status": True,
-        "is_database": True,
-        "data_filename": db_filename,
-        "tables": table_results,
-    }
+
+def _tar_entries(file_location: str, archive_filename: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> list:
+    """Extract each regular file from a tar archive and recursively process it.
+
+    Sanitizes member names to defeat path traversal and skips directories,
+    symlinks, and dotfiles.
+    """
+    results: list = []
+    with tarfile.open(file_location, "r") as tf:
+        for member in tf.getmembers():
+            if not member.isreg():
+                continue
+            base_name = os.path.basename(member.name)
+            if not base_name or base_name.startswith("."):
+                continue
+            dest_path = os.path.join(data_folder, base_name)
+            src = tf.extractfile(member)
+            if src is None:
+                continue
+            with open(dest_path, "wb") as out:
+                shutil.copyfileobj(src, out)
+            try:
+                sub_entries = _process_uploaded_file(dest_path, base_name, textgen_config, run_visualize)
+            except Exception as exc:
+                logger.warning(f"Skipping tar entry {base_name}: {exc}")
+                continue
+            for entry in sub_entries:
+                entry.setdefault("table_name", base_name)
+                results.append(entry)
+    return results
 
 
 # upload via url

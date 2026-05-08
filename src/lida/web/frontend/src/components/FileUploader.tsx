@@ -84,8 +84,8 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
       <div className="upload-methods">
         <div className="upload-method">
             <label className="button-like">
-                Upload File (CSV, JSON, XLSX, SQLite, .gz)
-                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3,.gz" hidden />
+                Upload File (CSV, JSON, XLSX, SQLite, .tar, .gz, .tar.gz)
+                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3,.tar,.tgz,.gz" hidden />
             </label>
         </div>
         <div className="divider">OR</div>

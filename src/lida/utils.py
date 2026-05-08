@@ -14,6 +14,9 @@ logger = logging.getLogger("lida")
 
 SQLITE_MAGIC = b"SQLite format 3\x00"
 SQLITE_EXTENSIONS = (".db", ".sqlite", ".sqlite3")
+GZIP_MAGIC = b"\x1f\x8b"
+TAR_MAGIC_OFFSET = 257
+TAR_MAGIC = b"ustar"
 
 
 def adapt_messages_for_provider(messages: List[Dict[str, str]], provider: str) -> List[Dict[str, str]]:
@@ -99,6 +102,25 @@ def is_sqlite_file(file_location: str) -> bool:
             return f.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC
     except OSError:
         return file_location.lower().endswith(SQLITE_EXTENSIONS)
+
+
+def is_gzip_file(file_location: str) -> bool:
+    """Detect gzip-wrapped uploads via the 0x1f 0x8b magic bytes."""
+    try:
+        with open(file_location, "rb") as f:
+            return f.read(len(GZIP_MAGIC)) == GZIP_MAGIC
+    except OSError:
+        return False
+
+
+def is_tar_archive(file_location: str) -> bool:
+    """Detect POSIX tar archives via the 'ustar' magic at offset 257."""
+    try:
+        with open(file_location, "rb") as f:
+            f.seek(TAR_MAGIC_OFFSET)
+            return f.read(len(TAR_MAGIC)) == TAR_MAGIC
+    except OSError:
+        return False
 
 
 def list_sqlite_tables(file_location: str) -> List[str]:
