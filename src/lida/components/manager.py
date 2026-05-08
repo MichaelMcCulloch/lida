@@ -1,7 +1,7 @@
 import logging
 from typing import List, Union
 import pandas as pd
-from llmx import TextGenerator, TextGenerationConfig
+from lida.llm_types import TextGenerator, TextGenerationConfig
 
 from lida.domain.models import Goal, Summary, Persona
 from lida.application.services import LidaApplication

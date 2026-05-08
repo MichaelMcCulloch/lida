@@ -4,7 +4,7 @@ import os
 from dataclasses import field
 from typing import Any, Dict, List, Optional, Union
 
-from llmx import TextGenerationConfig
+from .llm_types import TextGenerationConfig
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
 

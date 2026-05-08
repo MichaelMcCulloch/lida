@@ -2,7 +2,7 @@ import json
 import logging
 from typing import List, Optional
 
-from llmx import TextGenerator, TextGenerationConfig
+from lida.llm_types import TextGenerator, TextGenerationConfig
 
 from lida.domain.models import Persona, Summary
 from lida.domain.ports import IPersonaGenerator

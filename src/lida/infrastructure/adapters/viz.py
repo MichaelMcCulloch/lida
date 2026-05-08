@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from llmx import TextGenerator, TextGenerationConfig, TextGenerationResponse
+from lida.llm_types import TextGenerator, TextGenerationConfig, TextGenerationResponse
 
 from lida.components.scaffold import ChartScaffold
 from lida.domain.models import Goal, Summary

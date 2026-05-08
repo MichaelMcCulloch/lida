@@ -3,7 +3,7 @@ import logging
 import warnings
 from typing import Dict, List, Optional, Union
 import pandas as pd
-from llmx import TextGenerator, TextGenerationConfig
+from lida.llm_types import TextGenerator, TextGenerationConfig
 
 from lida.domain.models import Summary
 from lida.domain.ports import ISummarizer

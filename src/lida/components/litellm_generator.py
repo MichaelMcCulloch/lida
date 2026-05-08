@@ -5,8 +5,7 @@ from typing import Dict, List, Optional
 
 from openai import OpenAI
 
-from llmx.datamodel import Message, TextGenerationConfig, TextGenerationResponse
-from llmx.generators.text.base_textgen import TextGenerator
+from lida.llm_types import Message, TextGenerationConfig, TextGenerationResponse, TextGenerator
 
 logger = logging.getLogger("lida")
 

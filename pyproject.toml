@@ -21,7 +21,6 @@ dependencies = [
     "fastapi",
     "geopandas",
     "kaleido>=0.2.1, !=0.2.1.post1",
-    "llmx",
     "matplotlib-venn",
     "matplotlib",
     "networkx",
