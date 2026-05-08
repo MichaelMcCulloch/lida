@@ -17,11 +17,20 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
 
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const compressed = pako.gzip(new Uint8Array(arrayBuffer), { level: 9 });
-      const compressedBlob = new Blob([compressed], { type: 'application/gzip' });
+      const bytes = new Uint8Array(arrayBuffer);
+      const isAlreadyGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
 
       const formData = new FormData();
-      formData.append('file', compressedBlob, `${file.name}.gz`);
+      if (isAlreadyGzip) {
+        // Pass through; the file already has a .gz signature. Ensure the name
+        // ends with .gz so the server's decompress step picks it up.
+        const gzName = /\.gz$/i.test(file.name) ? file.name : `${file.name}.gz`;
+        formData.append('file', file, gzName);
+      } else {
+        const compressed = pako.gzip(bytes, { level: 9 });
+        const compressedBlob = new Blob([compressed], { type: 'application/gzip' });
+        formData.append('file', compressedBlob, `${file.name}.gz`);
+      }
 
       const res = await fetch('/api/v1/summarize', {
         method: 'POST',
@@ -75,8 +84,8 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
       <div className="upload-methods">
         <div className="upload-method">
             <label className="button-like">
-                Upload File (CSV, JSON, XLSX, SQLite)
-                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3" hidden />
+                Upload File (CSV, JSON, XLSX, SQLite, .gz)
+                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3,.gz" hidden />
             </label>
         </div>
         <div className="divider">OR</div>
