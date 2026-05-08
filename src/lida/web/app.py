@@ -1,6 +1,8 @@
+import gzip
 import os
 import logging
 import requests
+import shutil
 import traceback
 import multiprocessing
 import matplotlib
@@ -11,7 +13,7 @@ from fastapi import FastAPI, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from lida.utils import read_dataframe
+from lida.utils import is_sqlite_file, read_dataframe, read_sqlite_tables
 
 from ..components.litellm_generator import LiteLLMTextGenerator
 from ..datamodel import (
@@ -93,6 +95,65 @@ def execute_chart_worker(code, data_df, summary, library):
 
     executor = ChartExecutorAdapter()
     return executor.execute(code_specs=[code], data=data_df, summary=summary, library=library)
+
+
+def summarize_and_visualize(file_location: str, display_name: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> dict:
+    """Run the full summarize -> heuristic goals -> parallel chart pipeline for one tabular file.
+
+    Returns a dict with summary, data_filename, and (if run_visualize) goals + charts.
+    """
+    summary = lida.summarize(
+        data=file_location,
+        file_name=display_name,
+        summary_method="llm",
+        textgen_config=textgen_config,
+    )
+    result = {"summary": summary, "data_filename": display_name}
+
+    if not run_visualize:
+        return result
+
+    try:
+        goals = lida.goals(summary, n=20, textgen_config=textgen_config, method="heuristic")
+        goals_with_code = []
+        for i, goal in enumerate(goals):
+            code_list = lida.visualize(
+                summary=summary,
+                goal=goal,
+                textgen_config=textgen_config,
+                library="seaborn",
+                method="heuristic",
+                return_error=True,
+            )
+            if code_list:
+                goals_with_code.append((i, goal, code_list[0]))
+            else:
+                logger.info(f"Failed to generate code for goal {goal.index} (table={display_name})")
+
+        charts: list = []
+        if goals_with_code:
+            data_df = read_dataframe(file_location)
+            max_workers = min(len(goals_with_code), os.cpu_count() or 4)
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+                future_to_index = {executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal) for i, goal, code in goals_with_code}
+                rendered = []
+                for future in as_completed(future_to_index):
+                    i, goal = future_to_index[future]
+                    try:
+                        chart_executed = future.result()
+                        if chart_executed:
+                            rendered.append((i, chart_executed[0]))
+                    except Exception as exc:
+                        logger.warning(f"Chart exception for goal {goal.index} (table={display_name}): {exc}")
+                rendered.sort(key=lambda x: x[0])
+                charts = [r[1] for r in rendered]
+        result["goals"] = goals
+        result["charts"] = charts
+    except Exception as exc:
+        logger.error(f"Heuristic flow error for {display_name}: {exc}")
+        logger.debug(traceback.format_exc())
+    return result
 
 
 @api.post("/visualize")
@@ -321,134 +382,78 @@ async def upload_file(
     file: UploadFile,
     visualize: bool = os.environ.get("LIDA_MO_INSTANT_ANALYSIS", "true").lower() == "true",
 ):
-    """Upload a file and return a summary of the data"""
+    """Upload a file and return a summary of the data.
 
-    # allow csv, excel, json
-
-    # if file.content_type not in allowed_types:
-    #     return {
-    #         "status": False,
-    #         "message": f"Uploaded file type ({file.content_type}) not allowed. Allowed types are: csv, xls, xlsx, json",
-    #     }
+    Tabular files (csv/json/excel/parquet/feather) are summarized as a single
+    dataset. SQLite uploads are unpacked into one summary per user table; the
+    response includes a ``tables`` list with per-table summaries (and goals/charts
+    when ``visualize`` is true).
+    """
 
     try:
-        # save file to files folder
-        file_location = os.path.join(data_folder, file.filename)
-        # open file without deleting existing contents
-        with open(file_location, "wb+") as file_object:
+        saved_path = os.path.join(data_folder, file.filename)
+        with open(saved_path, "wb+") as file_object:
             file_object.write(file.file.read())
 
-        # summarize
+        file_location, display_name = _decompress_if_gzipped(saved_path, file.filename)
+
         textgen_config = TextGenerationConfig(n=1, temperature=0)
-        summary = lida.summarize(
-            data=file_location,
-            file_name=file.filename,
-            summary_method="llm",
-            textgen_config=textgen_config,
-        )
 
-        response = {"status": True, "summary": summary, "data_filename": file.filename}
+        if is_sqlite_file(file_location):
+            return _summarize_sqlite(file_location, display_name, textgen_config, visualize)
 
-        print(f"DEBUG: Summary generated. Visualize flag: {visualize}")
-
-        if visualize:
-            # Automatic visualization flow (Heuristic)
-            print("DEBUG: Automatic heuristic visualization triggered")
-            try:
-                goals = lida.goals(summary, n=20, textgen_config=textgen_config, method="heuristic")
-                print(f"DEBUG: Generated {len(goals)} heuristic goals")
-                # Generate charts for these goals
-                charts = []
-
-                # Step 1: Generate code for all goals first (sequential, low latency)
-                goals_with_code = []
-                print("DEBUG: Generating code for all goals...")
-                for i, goal in enumerate(goals):
-                    code_list = lida.visualize(
-                        summary=summary,
-                        goal=goal,
-                        textgen_config=textgen_config,
-                        library="seaborn",
-                        method="heuristic",
-                        return_error=True,
-                    )
-                    if code_list:
-                        goals_with_code.append((i, goal, code_list[0]))
-                    else:
-                        print(f"DEBUG: Failed to generate code for goal {goal.index}")
-
-                # Step 2: Execute charts in parallel
-                print(f"DEBUG: Executing {len(goals_with_code)} charts in parallel...")
-                if len(goals_with_code) > 0:
-                    data_df = read_dataframe(file_location)  # Read once
-
-                    # Use ProcessPoolExecutor for parallel execution
-                    # Adjust max_workers as needed, default to None (os.cpu_count()) or a safe number
-                    max_workers = min(len(goals_with_code), os.cpu_count() or 4)
-
-                    # Use 'spawn' context to avoid gRPC (Gemini) deadlocks in forked processes
-                    ctx = multiprocessing.get_context("spawn")
-                    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
-                        # Map futures to their index to maintain order if needed, or just collect
-                        future_to_index = {executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal) for i, goal, code in goals_with_code}
-
-                        # Collect results as they complete
-                        metrics_executed = 0
-
-                        # We need to reconstruct the order or just append.
-                        # The UI expects 'charts' list. If order matters (matching goals?),
-                        # we should probably effectively re-sort or returning a map.
-                        # Goals are returned in 'goals' list. Charts are in 'charts' list.
-                        # The frontend likely maps charts[i] to goals[i] if indices match,
-                        # OR the goal object is embedded.
-                        # In the original code:
-                        #   for i, goal in enumerate(goals): ... charts.append(chart_executed[0])
-                        # failed execution -> no chart appended?
-                        # actually, if chart_executed is empty, nothing appended.
-                        # This implies 'charts' length might be < 'goals' length.
-                        # Let's verify existing logic:
-                        # if chart_executed: charts.append(chart_executed[0])
-                        # else: print (failed)
-                        # So charts list corresponds to SUCCESSFUL charts, but losing alignment with 'goals' list.
-                        # If the frontend relies on index alignment, the original code is buggy if any chart fails.
-                        # Let's assume we just want valid charts.
-
-                        # However, for consistency with parallel execution, we should try to keep order or just append valid ones.
-
-                        results = []
-                        for future in as_completed(future_to_index):
-                            i, goal = future_to_index[future]
-                            try:
-                                chart_executed = future.result()
-                                if chart_executed and len(chart_executed) > 0:
-                                    results.append((i, chart_executed[0]))
-                                    metrics_executed += 1
-                                else:
-                                    print(f"DEBUG: Worker returned no chart for goal {goal.index}")
-                            except Exception as exc:
-                                print(f"DEBUG: Chart execution generated an exception for goal {goal.index}: {exc}")
-
-                        # Sort by original index to maintain heuristic order (importance)
-                        results.sort(key=lambda x: x[0])
-                        charts = [r[1] for r in results]
-
-                        print(f"DEBUG: Successfully executed {metrics_executed} charts")
-
-                print(f"DEBUG: Total charts generated: {len(charts)}")
-                response["goals"] = goals
-                response["charts"] = charts
-            except Exception as e:
-                print(f"DEBUG: Error in heuristic flow: {e}")
-                import traceback
-
-                traceback.print_exc()
-        else:
-            print("DEBUG: Visualization skipped (visualize=False)")
-
-        return response
+        result = summarize_and_visualize(file_location, display_name, textgen_config, visualize)
+        return {"status": True, **result}
     except Exception as exception_error:
         logger.error(f"Error processing file: {str(exception_error)}")
+        logger.debug(traceback.format_exc())
         return {"status": False, "message": "Error processing file."}
+
+
+def _decompress_if_gzipped(saved_path: str, original_filename: str) -> tuple[str, str]:
+    """If the uploaded file is gzip-wrapped, materialize the inner file alongside it.
+
+    Returns (canonical_path, canonical_filename). The original .gz is removed so
+    downstream callers see the un-wrapped file, which is required for SQLite magic
+    detection and avoids confusion in `summary.file_name`.
+    """
+    if not original_filename.lower().endswith(".gz"):
+        return saved_path, original_filename
+    inner_name = original_filename[:-3]
+    if not inner_name:
+        return saved_path, original_filename
+    inner_path = os.path.join(data_folder, inner_name)
+    with gzip.open(saved_path, "rb") as src, open(inner_path, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+    try:
+        os.unlink(saved_path)
+    except OSError:
+        pass
+    return inner_path, inner_name
+
+
+def _summarize_sqlite(file_location: str, db_filename: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> dict:
+    """Materialize each user table as a CSV, then run the standard pipeline per table."""
+    tables = read_sqlite_tables(file_location)
+    if not tables:
+        return {"status": False, "message": "No user tables found in the database."}
+
+    stem, _ = os.path.splitext(db_filename)
+    table_results: list = []
+    for table_name, df in tables.items():
+        csv_filename = f"{stem}__{table_name}.csv"
+        csv_path = os.path.join(data_folder, csv_filename)
+        df.to_csv(csv_path, index=False)
+        per_table = summarize_and_visualize(csv_path, csv_filename, textgen_config, run_visualize)
+        per_table["table_name"] = table_name
+        table_results.append(per_table)
+
+    return {
+        "status": True,
+        "is_database": True,
+        "data_filename": db_filename,
+        "tables": table_results,
+    }
 
 
 # upload via url

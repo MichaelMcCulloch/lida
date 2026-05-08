@@ -1,5 +1,6 @@
 import base64
 import logging
+import sqlite3
 from typing import List, Tuple, Union, Dict
 import os
 import io
@@ -10,6 +11,9 @@ import matplotlib.pyplot as plt
 import tiktoken
 
 logger = logging.getLogger("lida")
+
+SQLITE_MAGIC = b"SQLite format 3\x00"
+SQLITE_EXTENSIONS = (".db", ".sqlite", ".sqlite3")
 
 
 def adapt_messages_for_provider(messages: List[Dict[str, str]], provider: str) -> List[Dict[str, str]]:
@@ -86,6 +90,36 @@ def read_dataframe(file_location: str, encoding: str = "utf-8") -> pd.DataFrame:
         df = df.sample(4500, random_state=42)
 
     return df
+
+
+def is_sqlite_file(file_location: str) -> bool:
+    """Detect SQLite databases via file magic; falls back to extension if unreadable."""
+    try:
+        with open(file_location, "rb") as f:
+            return f.read(len(SQLITE_MAGIC)) == SQLITE_MAGIC
+    except OSError:
+        return file_location.lower().endswith(SQLITE_EXTENSIONS)
+
+
+def list_sqlite_tables(file_location: str) -> List[str]:
+    """Return the user-defined table names in a SQLite database (sqlite_* internals excluded)."""
+    with sqlite3.connect(f"file:{file_location}?mode=ro", uri=True) as conn:
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        return [row[0] for row in cur.fetchall()]
+
+
+def read_sqlite_tables(file_location: str) -> Dict[str, pd.DataFrame]:
+    """Load every user table in a SQLite database into a dict of DataFrames (cleaned & sampled)."""
+    tables: Dict[str, pd.DataFrame] = {}
+    with sqlite3.connect(f"file:{file_location}?mode=ro", uri=True) as conn:
+        for name in list_sqlite_tables(file_location):
+            df = pd.read_sql_query(f'SELECT * FROM "{name}"', conn)
+            df = clean_column_names(df)
+            if len(df) > 4500:
+                logger.info(f"Sampling table '{name}' down from {len(df)} to 4500 rows.")
+                df = df.sample(4500, random_state=42)
+            tables[name] = df
+    return tables
 
 
 def file_to_df(file_location: str):

@@ -12,10 +12,16 @@ interface Summary {
     fields?: any[];
 }
 
+interface TableResult {
+    table_name: string;
+    data_filename: string;
+    summary: Summary;
+    goals?: any[];
+    charts?: any[];
+}
+
 import { GoalGenerator } from './components/GoalGenerator';
 import { Visualizer } from './components/Visualizer';
-
-// ... interface Summary ...
 
 function App() {
   const [activeModel, setActiveModel] = useState<{provider: string, model: string}>({provider: '', model: ''});
@@ -24,18 +30,38 @@ function App() {
   const [initialGoals, setInitialGoals] = useState<any[]>([]);
   const [initialCharts, setInitialCharts] = useState<any[]>([]);
   const [error, setError] = useState<string>('');
+  const [tables, setTables] = useState<TableResult[] | null>(null);
+  const [activeTable, setActiveTable] = useState<string | null>(null);
+  const [databaseFilename, setDatabaseFilename] = useState<string | null>(null);
 
   const handleModelChange = useCallback((provider: string, model: string) => {
     setActiveModel({ provider, model });
     console.log(`Selected: ${provider} - ${model}`);
   }, []);
 
+  const applyTable = (t: TableResult) => {
+      setSummary(t.summary);
+      setInitialGoals(t.goals || []);
+      setInitialCharts(t.charts || []);
+      setActiveTable(t.table_name);
+      setSelectedGoal(null);
+  };
+
   const handleUploadSuccess = (data: any) => {
-      setSummary(data.summary);
-      setInitialGoals(data.goals || []);
-      setInitialCharts(data.charts || []);
       setError('');
       setSelectedGoal(null);
+      if (data.is_database && Array.isArray(data.tables) && data.tables.length > 0) {
+          setTables(data.tables);
+          setDatabaseFilename(data.data_filename || null);
+          applyTable(data.tables[0]);
+      } else {
+          setTables(null);
+          setDatabaseFilename(null);
+          setActiveTable(null);
+          setSummary(data.summary);
+          setInitialGoals(data.goals || []);
+          setInitialCharts(data.charts || []);
+      }
   };
 
   const handleUploadError = (msg: string) => {
@@ -44,6 +70,9 @@ function App() {
       setInitialGoals([]);
       setInitialCharts([]);
       setSelectedGoal(null);
+      setTables(null);
+      setActiveTable(null);
+      setDatabaseFilename(null);
   };
 
   const handleGoalSelect = (goal: any) => {
@@ -77,11 +106,37 @@ function App() {
             </section>
         ) : (
             <div style={{width: '100%', display: 'flex', flexDirection: 'column', gap: '2rem'}}>
+                {tables && (
+                    <section className="tables-area">
+                        <div className="summary-card">
+                            <h3>Database Tables</h3>
+                            <p style={{color: 'var(--color-text-muted)', marginTop: '0.25rem'}}>
+                                <strong>{databaseFilename}</strong> — {tables.length} table{tables.length === 1 ? '' : 's'}. Select a table to explore.
+                            </p>
+                            <div style={{marginTop: '1rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem'}}>
+                                {tables.map((t) => (
+                                    <button
+                                        key={t.table_name}
+                                        onClick={() => applyTable(t)}
+                                        className={activeTable === t.table_name ? 'primary' : 'secondary'}
+                                        style={{fontSize: '0.9rem'}}
+                                    >
+                                        {t.table_name}
+                                        <small style={{marginLeft: '0.4rem', opacity: 0.75}}>
+                                            ({t.summary.field_names?.length ?? 0} cols)
+                                        </small>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+                    </section>
+                )}
+
                 <section className="summary-area">
                     <div className="summary-card">
                         <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
-                            <h3>Dataset Summary</h3>
-                            <button className="secondary" onClick={() => { setSummary(null); setSelectedGoal(null); }} style={{fontSize: '0.9rem'}}>Reset / New Upload</button>
+                            <h3>Dataset Summary{activeTable ? ` — ${activeTable}` : ''}</h3>
+                            <button className="secondary" onClick={() => { setSummary(null); setSelectedGoal(null); setTables(null); setActiveTable(null); setDatabaseFilename(null); }} style={{fontSize: '0.9rem'}}>Reset / New Upload</button>
                         </div>
                         <div style={{marginTop: '1rem', display: 'grid', gap: '0.5rem'}}>
                             <div><strong>Name:</strong> {summary.name}</div>

@@ -16,17 +16,11 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
     setLoading(true);
 
     try {
-      // Read file as ArrayBuffer
       const arrayBuffer = await file.arrayBuffer();
-      
-      // Compress using pako with maximum compression
       const compressed = pako.gzip(new Uint8Array(arrayBuffer), { level: 9 });
-      
-      // Create blob from compressed data
       const compressedBlob = new Blob([compressed], { type: 'application/gzip' });
-      
+
       const formData = new FormData();
-      // Append with .gz extension so backend knows it's compressed
       formData.append('file', compressedBlob, `${file.name}.gz`);
 
       const res = await fetch('/api/v1/summarize', {
@@ -34,7 +28,7 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
         body: formData,
       });
       const data = await res.json();
-      
+
       if (data.status) {
         onSuccess(data);
       } else {
@@ -81,8 +75,8 @@ export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }
       <div className="upload-methods">
         <div className="upload-method">
             <label className="button-like">
-                Upload File (CSV, JSON)
-                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx" hidden />
+                Upload File (CSV, JSON, XLSX, SQLite)
+                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3" hidden />
             </label>
         </div>
         <div className="divider">OR</div>
