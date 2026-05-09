@@ -1,18 +1,19 @@
 import React from 'react';
 import type {
   ChartEntry,
-  GoalEntry,
+  GoalWithSource,
   PlotStatus,
 } from '../hooks/useUploadPipeline';
 
 interface GoalsBoardProps {
-  goals: GoalEntry[];
+  goals: GoalWithSource[];
   charts: Record<number, ChartEntry>;
   plotStatuses: Record<number, PlotStatus>;
   plotErrors: Record<number, string>;
   totalExpected: number;
-  onGoalSelect: (goal: GoalEntry) => void;
+  onGoalSelect: (item: GoalWithSource) => void;
   selectedIndex: number | null;
+  showDataSource: boolean;
 }
 
 const STATUS_COPY: Record<PlotStatus, string> = {
@@ -35,8 +36,6 @@ const ChartSlot: React.FC<{ chart?: ChartEntry; status: PlotStatus; error?: stri
       </div>
     );
   }
-  // If a chart object arrived but had no raster, the executor failed silently —
-  // surface it as a failure rather than spin forever.
   if (status === 'failed' || (chart && !chart.raster)) {
     const detail = error || (chart?.error?.message as string | undefined) || 'Chart failed';
     return (
@@ -62,14 +61,14 @@ export const GoalsBoard: React.FC<GoalsBoardProps> = ({
   totalExpected,
   onGoalSelect,
   selectedIndex,
+  showDataSource,
 }) => {
-  // Reserve placeholders for goals not yet streamed in so the board sizes
-  // up immediately to N rows rather than popping in.
   const placeholders = Math.max(0, totalExpected - goals.length);
 
   return (
     <div className="goals-board">
-      {goals.map((goal) => {
+      {goals.map((item) => {
+        const goal = item.goal;
         const status = plotStatuses[goal.index] ?? 'pending';
         const chart = charts[goal.index];
         const isSelected = selectedIndex === goal.index;
@@ -77,7 +76,7 @@ export const GoalsBoard: React.FC<GoalsBoardProps> = ({
           <article
             key={goal.index}
             className={`goal-row ${isSelected ? 'goal-row--selected' : ''}`}
-            onClick={() => onGoalSelect(goal)}
+            onClick={() => onGoalSelect(item)}
           >
             <header className="goal-row__header">
               <span className="goal-row__index">{goal.index + 1}</span>
@@ -86,6 +85,9 @@ export const GoalsBoard: React.FC<GoalsBoardProps> = ({
                 {STATUS_COPY[status]}
               </span>
             </header>
+            {showDataSource && item.dataSource && (
+              <div className="goal-row__source-pill">{item.dataSource}</div>
+            )}
             <p className="goal-row__rationale">{goal.rationale}</p>
             <ChartSlot chart={chart} status={status} error={plotErrors[goal.index]} />
           </article>

@@ -828,6 +828,19 @@
   color: var(--color-text-muted);
 }
 
+.goal-row__source-pill {
+  display: inline-block;
+  width: fit-content;
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: rgba(6, 182, 212, 0.12);
+  color: var(--color-accent);
+  border: 1px solid rgba(6, 182, 212, 0.25);
+  font-family: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
+  letter-spacing: 0.02em;
+}
+
 .goal-row__status {
   font-size: 0.7rem;
   text-transform: lowercase;

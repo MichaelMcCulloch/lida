@@ -8,8 +8,8 @@ import { useUploadPipeline } from './hooks/useUploadPipeline';
 import type { GoalEntry, TableProgress } from './hooks/useUploadPipeline';
 
 interface SelectedGoal {
-  tableName: string;
   goal: GoalEntry;
+  dataSource: string;
 }
 
 function App() {
@@ -96,41 +96,54 @@ function App() {
     return tables[0];
   }, [tables, activeTableName]);
 
-  // The progressive view appears the moment the first summary lands, even
-  // before the pipeline finishes — so the user sees goals/charts streaming in.
+  // Goals + charts live at the top of the pipeline state (one cross-dataset
+  // call produces them all). For multi-table uploads the goals are shown
+  // together; the data_source pill on each card identifies the table.
+  const goals = pipeline.state.goals;
+  const goalsTotal = pipeline.state.goalsTotal || nGoals;
+  const charts = pipeline.state.charts;
+  const plotStatuses = pipeline.state.plotStatuses;
+  const plotErrors = pipeline.state.plotErrors;
+
   const hasProgressiveSummary = !!activeTable?.summary;
   const showResults = hasProgressiveSummary || urlResult !== null;
 
-  // For URL upload (non-streaming), build a synthetic "table" view so the
-  // same GoalsBoard layout works.
-  const urlTable: TableProgress | null = useMemo(() => {
-    if (!urlResult) return null;
-    const charts: Record<number, any> = {};
-    const plotStatuses: Record<number, any> = {};
-    (urlResult.charts || []).forEach((chart: any, i: number) => {
-      charts[i] = chart;
-      plotStatuses[i] = 'rendered';
-    });
-    return {
-      name: urlResult.data_filename || 'remote dataset',
-      status: 'done',
-      chartsRendered: (urlResult.charts || []).length,
-      chartsTotal: (urlResult.goals || []).length,
-      summary: urlResult.summary,
-      goals: (urlResult.goals || []).map((g: any, i: number) => ({
+  // URL upload (non-streaming) — wrap into the same shape so the rest of the
+  // UI doesn't have to branch on it.
+  const urlGoals = useMemo(() => {
+    if (!urlResult) return [];
+    return (urlResult.goals || []).map((g: any, i: number) => ({
+      goal: {
         index: typeof g.index === 'number' ? g.index : i,
         question: g.question || '',
         visualization: g.visualization || '',
         rationale: g.rationale || '',
-      })),
-      charts,
-      plotStatuses,
-      plotErrors: {},
-    };
+      },
+      dataSource: urlResult.data_filename || '',
+    }));
   }, [urlResult]);
 
-  const displayedTable: TableProgress | null = activeTable ?? urlTable;
-  const summary = displayedTable?.summary;
+  const urlCharts = useMemo(() => {
+    if (!urlResult) return {};
+    const out: Record<number, any> = {};
+    (urlResult.charts || []).forEach((c: any, i: number) => { out[i] = c; });
+    return out;
+  }, [urlResult]);
+
+  const urlPlotStatuses = useMemo(() => {
+    if (!urlResult) return {};
+    const out: Record<number, any> = {};
+    (urlResult.charts || []).forEach((_: any, i: number) => { out[i] = 'rendered'; });
+    return out;
+  }, [urlResult]);
+
+  const displayedSummary = activeTable?.summary ?? urlResult?.summary ?? null;
+  const displayedGoals = urlResult ? urlGoals : goals;
+  const displayedCharts = urlResult ? urlCharts : charts;
+  const displayedPlotStatuses = urlResult ? urlPlotStatuses : plotStatuses;
+  const displayedPlotErrors = urlResult ? {} : plotErrors;
+  const displayedTotal = urlResult ? urlGoals.length : goalsTotal;
+  const displayedTableName = activeTable?.name ?? urlResult?.data_filename ?? '';
 
   return (
     <div className="container">
@@ -175,32 +188,32 @@ function App() {
           />
         </section>
 
-        {showResults && summary && displayedTable && (
+        {showResults && displayedSummary && (
           <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '2rem' }}>
             {isMultiTable && tables.length > 0 && (
               <section className="tables-area">
                 <div className="summary-card">
                   <h3>Tables</h3>
                   <p style={{ color: 'var(--color-text-muted)', marginTop: '0.25rem' }}>
-                    {tables.length} table{tables.length === 1 ? '' : 's'} detected. Select one to explore.
+                    {tables.length} table{tables.length === 1 ? '' : 's'} detected. Select one to view its summary.
                   </p>
                   <div style={{ marginTop: '1rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-                    {tables.map((t) => (
-                      <button
-                        key={t.name}
-                        onClick={() => {
-                          setActiveTableName(t.name);
-                          setSelectedGoal(null);
-                        }}
-                        className={displayedTable?.name === t.name ? 'primary' : 'secondary'}
-                        style={{ fontSize: '0.9rem' }}
-                      >
-                        {t.name}
-                        <small style={{ marginLeft: '0.4rem', opacity: 0.75 }}>
-                          ({t.goals.length}/{t.chartsTotal || nGoals})
-                        </small>
-                      </button>
-                    ))}
+                    {tables.map((t) => {
+                      const goalsForTable = goals.filter((g) => g.dataSource === t.name).length;
+                      return (
+                        <button
+                          key={t.name}
+                          onClick={() => setActiveTableName(t.name)}
+                          className={displayedTableName === t.name ? 'primary' : 'secondary'}
+                          style={{ fontSize: '0.9rem' }}
+                        >
+                          {t.name}
+                          <small style={{ marginLeft: '0.4rem', opacity: 0.75 }}>
+                            ({goalsForTable} goal{goalsForTable === 1 ? '' : 's'})
+                          </small>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
               </section>
@@ -208,10 +221,10 @@ function App() {
 
             <section className="summary-area">
               <div className="summary-card">
-                <h3>Dataset Summary{displayedTable.name ? ` — ${displayedTable.name}` : ''}</h3>
+                <h3>Dataset Summary{displayedTableName ? ` — ${displayedTableName}` : ''}</h3>
                 <div style={{ marginTop: '1rem', display: 'grid', gap: '0.5rem' }}>
-                  <div><strong>Name:</strong> {summary.name}</div>
-                  <div><strong>Description:</strong> {summary.dataset_description}</div>
+                  <div><strong>Name:</strong> {displayedSummary.name}</div>
+                  <div><strong>Description:</strong> {displayedSummary.dataset_description}</div>
                 </div>
               </div>
             </section>
@@ -219,24 +232,32 @@ function App() {
             <section className="goals-area">
               <h3>Goals & Visualizations</h3>
               <GoalsBoard
-                goals={displayedTable.goals}
-                charts={displayedTable.charts}
-                plotStatuses={displayedTable.plotStatuses}
-                plotErrors={displayedTable.plotErrors}
-                totalExpected={displayedTable.chartsTotal || nGoals}
-                onGoalSelect={(goal) => setSelectedGoal({ tableName: displayedTable.name, goal })}
-                selectedIndex={selectedGoal?.tableName === displayedTable.name ? selectedGoal.goal.index : null}
+                goals={displayedGoals}
+                charts={displayedCharts}
+                plotStatuses={displayedPlotStatuses}
+                plotErrors={displayedPlotErrors}
+                totalExpected={displayedTotal}
+                onGoalSelect={(item) => setSelectedGoal(item)}
+                selectedIndex={selectedGoal ? selectedGoal.goal.index : null}
+                showDataSource={isMultiTable}
               />
             </section>
 
-            {selectedGoal && selectedGoal.tableName === displayedTable.name && (
+            {selectedGoal && (
               <section className="visualization-area">
                 <h3>Visualization</h3>
                 <p style={{ marginBottom: '1rem' }}>
                   <strong style={{ color: 'var(--color-accent)' }}>Goal:</strong> {selectedGoal.goal.question}
+                  {isMultiTable && (
+                    <span className="goal-row__source-pill" style={{ marginLeft: '0.5rem' }}>
+                      {selectedGoal.dataSource}
+                    </span>
+                  )}
                 </p>
                 <Visualizer
-                  summary={summary}
+                  summary={
+                    tables.find((t) => t.name === selectedGoal.dataSource)?.summary ?? displayedSummary
+                  }
                   goal={selectedGoal.goal}
                   library="seaborn"
                 />
