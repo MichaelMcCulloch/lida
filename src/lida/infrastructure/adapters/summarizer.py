@@ -21,6 +21,47 @@ You must return an updated JSON dictionary without any preamble or explanation.
 """
 
 
+def _blob_len(v) -> int:
+    """Length of a bytes-like value in bytes; 0 if it isn't sized."""
+    if v is None:
+        return 0
+    try:
+        return len(v)
+    except TypeError:
+        return 0
+
+
+def _scrub_value(v):
+    """Convert any non-LLM-safe value to a placeholder string.
+
+    Belt-and-suspenders for stragglers (mixed-type object columns, weird
+    extension dtypes) that slipped past the binary detection in
+    get_column_properties. Anything bytes-like is summarized by size; the
+    raw payload never reaches the prompt.
+    """
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return f"<binary blob: {_blob_len(v)} bytes>"
+    return v
+
+
+def _scrub_samples(samples: List) -> List:
+    return [_scrub_value(s) for s in samples]
+
+
+def _scrub_summary(obj):
+    """Recursively scrub a summary dict before it is rendered into a prompt.
+
+    Catches any bytes that escaped the column-level pass — e.g. embedded in
+    nested structures or numpy bytes_ scalars."""
+    if isinstance(obj, dict):
+        return {k: _scrub_summary(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_summary(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_scrub_summary(v) for v in obj)
+    return _scrub_value(obj)
+
+
 class SummarizerAdapter(ISummarizer):
     def __init__(self, text_gen: TextGenerator):
         self.text_gen = text_gen
@@ -39,7 +80,7 @@ class SummarizerAdapter(ISummarizer):
         properties_list = []
         for column in df.columns:
             dtype = df[column].dtype
-            properties = {}
+            properties: Dict = {}
             if dtype in [int, float, complex]:
                 properties["dtype"] = "number"
                 properties["std"] = self.check_type(dtype, df[column].std())
@@ -49,16 +90,32 @@ class SummarizerAdapter(ISummarizer):
             elif pd.api.types.is_bool_dtype(df[column]):
                 properties["dtype"] = "boolean"
             elif pd.api.types.is_object_dtype(df[column]):
-                try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        pd.to_datetime(df[column], errors="raise")
-                        properties["dtype"] = "date"
-                except ValueError:
-                    if df[column].nunique() / len(df[column]) < 0.5:
-                        properties["dtype"] = "category"
-                    else:
-                        properties["dtype"] = "string"
+                # SQLite BLOBs and similar arrive as bytes/bytearray/memoryview.
+                # We must NOT feed raw bytes into an LLM prompt — they get
+                # rendered as escape sequences and either echoed back or
+                # hallucinated against (observed: little-endian float32 garbage
+                # in DeepSeek output for embedding tables).
+                first_non_null = next(
+                    (v for v in df[column].dropna().head(5)),
+                    None,
+                )
+                if isinstance(first_non_null, (bytes, bytearray, memoryview)):
+                    properties["dtype"] = "binary"
+                else:
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            pd.to_datetime(df[column], errors="raise")
+                            properties["dtype"] = "date"
+                    except (ValueError, TypeError):
+                        try:
+                            ratio = df[column].nunique() / max(1, len(df[column]))
+                        except (TypeError, ValueError):
+                            ratio = 1.0
+                        if ratio < 0.5:
+                            properties["dtype"] = "category"
+                        else:
+                            properties["dtype"] = "string"
             elif pd.api.types.is_categorical_dtype(df[column]):
                 properties["dtype"] = "category"
             elif pd.api.types.is_datetime64_any_dtype(df[column]):
@@ -75,12 +132,36 @@ class SummarizerAdapter(ISummarizer):
                     properties["min"] = cast_date_col.min()
                     properties["max"] = cast_date_col.max()
 
-            nunique = df[column].nunique()
+            if properties["dtype"] == "binary":
+                sizes = df[column].dropna().apply(_blob_len)
+                if len(sizes) > 0:
+                    properties["min_size_bytes"] = int(sizes.min())
+                    properties["max_size_bytes"] = int(sizes.max())
+                    properties["mean_size_bytes"] = float(round(sizes.mean(), 2))
+                # Stand-in samples that describe shape without leaking content.
+                properties["samples"] = [
+                    f"<binary blob: {int(s)} bytes>"
+                    for s in sizes.head(min(n_samples, 3)).tolist()
+                ]
+                # nunique() on bytes is hashable but pointless for blobs; skip.
+                properties["num_unique_values"] = int(len(sizes))
+                properties["semantic_type"] = ""
+                properties["description"] = ""
+                properties_list.append({"column": column, "properties": properties})
+                continue
+
+            try:
+                nunique = df[column].nunique()
+            except (TypeError, ValueError):
+                nunique = 0
             if "samples" not in properties:
                 non_null_values = df[column][df[column].notnull()].unique()
-                n_samples = min(n_samples, len(non_null_values))
-                samples = pd.Series(non_null_values).sample(n_samples, random_state=42).tolist()
-                properties["samples"] = samples
+                n_samples_col = min(n_samples, len(non_null_values))
+                if n_samples_col > 0:
+                    samples = pd.Series(non_null_values).sample(n_samples_col, random_state=42).tolist()
+                else:
+                    samples = []
+                properties["samples"] = _scrub_samples(samples)
             properties["num_unique_values"] = nunique
             properties["semantic_type"] = ""
             properties["description"] = ""
@@ -96,13 +177,18 @@ class SummarizerAdapter(ISummarizer):
         """Enrich the data summary with descriptions"""
         logger.info("Enriching the data summary with descriptions")
 
+        # Final defense: scrub any bytes-like values from the summary tree
+        # before f-stringing into the prompt. The column-level pass catches
+        # the common case (BLOB columns); this catches stragglers.
+        prompt_summary = _scrub_summary(base_summary)
+
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "assistant",
                 "content": f"""
         Annotate the dictionary below. Only return a JSON object.
-        {base_summary}
+        {prompt_summary}
         """,
             },
         ]
