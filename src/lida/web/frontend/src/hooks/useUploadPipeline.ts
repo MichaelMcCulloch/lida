@@ -24,12 +24,35 @@ export interface LlmActivity {
   tail: string;
 }
 
+export type PlotStatus = 'pending' | 'generating' | 'code_ready' | 'rendered' | 'failed';
+
+export interface GoalEntry {
+  index: number;
+  question: string;
+  visualization: string;
+  rationale: string;
+}
+
+export interface ChartEntry {
+  spec?: any;
+  status: boolean;
+  raster?: string | null;
+  code?: string;
+  library?: string;
+  error?: any;
+}
+
 export interface TableProgress {
   name: string;
   status: 'pending' | 'analyzing' | 'goals' | 'visualizing' | 'done' | 'error';
   chartsRendered: number;
   chartsTotal: number;
   error?: string;
+  summary: any | null;
+  goals: GoalEntry[];
+  charts: Record<number, ChartEntry>;
+  plotStatuses: Record<number, PlotStatus>;
+  plotErrors: Record<number, string>;
 }
 
 export interface PipelineState {
@@ -44,6 +67,18 @@ export interface PipelineState {
   result: any | null;
   error: string | null;
 }
+
+const newTable = (name: string, status: TableProgress['status'] = 'pending'): TableProgress => ({
+  name,
+  status,
+  chartsRendered: 0,
+  chartsTotal: 0,
+  summary: null,
+  goals: [],
+  charts: {},
+  plotStatuses: {},
+  plotErrors: {},
+});
 
 const STAGE_LABELS: Record<StageId, string> = {
   compress: 'Compressing',
@@ -80,9 +115,25 @@ type Action =
   | { type: 'dispatch'; kind: 'single' | 'sqlite' | 'tar' }
   | { type: 'tables.detected'; names: string[] }
   | { type: 'table.status'; name: string; status: TableProgress['status']; error?: string }
-  | { type: 'chart.progress'; name: string; rendered: number; total: number }
+  | { type: 'table.summary'; name: string; summary: any }
+  | { type: 'goal.ready'; name: string; goal: GoalEntry }
+  | { type: 'goals.total'; name: string; total: number }
+  | { type: 'plot.status'; name: string; index: number; status: PlotStatus; error?: string }
+  | { type: 'chart.rendered'; name: string; index: number; chart: ChartEntry }
   | { type: 'complete'; result: any }
   | { type: 'error'; message: string };
+
+function updateTable(state: PipelineState, name: string, mut: (t: TableProgress) => TableProgress): PipelineState {
+  // If the table doesn't exist yet (e.g., events arrive before dispatch had
+  // a chance to populate the list), create it on demand.
+  if (!state.tables.some((t) => t.name === name)) {
+    state = { ...state, tables: [...state.tables, newTable(name)] };
+  }
+  return {
+    ...state,
+    tables: state.tables.map((t) => (t.name === name ? mut(t) : t)),
+  };
+}
 
 function reducer(state: PipelineState, action: Action): PipelineState {
   switch (action.type) {
@@ -140,38 +191,51 @@ function reducer(state: PipelineState, action: Action): PipelineState {
     case 'tables.detected':
       return {
         ...state,
-        tables: action.names.map((name) => ({
-          name,
-          status: 'pending',
-          chartsRendered: 0,
-          chartsTotal: 0,
-        })),
+        tables: action.names.map((name) => newTable(name)),
       };
     case 'table.status':
-      return {
-        ...state,
-        tables: state.tables.length === 0 && action.name
-          ? [{ name: action.name, status: action.status, chartsRendered: 0, chartsTotal: 0, error: action.error }]
-          : state.tables.map((t) =>
-              t.name === action.name ? { ...t, status: action.status, error: action.error } : t,
-            ),
-      };
-    case 'chart.progress':
-      return {
-        ...state,
-        tables: state.tables.length === 0
-          ? [{
-              name: action.name,
-              status: 'visualizing',
-              chartsRendered: action.rendered,
-              chartsTotal: action.total,
-            }]
-          : state.tables.map((t) =>
-              t.name === action.name
-                ? { ...t, chartsRendered: action.rendered, chartsTotal: action.total, status: 'visualizing' }
-                : t,
-            ),
-      };
+      return updateTable(state, action.name, (t) => ({
+        ...t,
+        status: action.status,
+        error: action.error,
+      }));
+    case 'table.summary':
+      return updateTable(state, action.name, (t) => ({ ...t, summary: action.summary }));
+    case 'goal.ready':
+      return updateTable(state, action.name, (t) => {
+        if (t.goals.some((g) => g.index === action.goal.index)) return t;
+        return { ...t, goals: [...t.goals, action.goal].sort((a, b) => a.index - b.index) };
+      });
+    case 'goals.total':
+      return updateTable(state, action.name, (t) => ({ ...t, chartsTotal: Math.max(t.chartsTotal, action.total) }));
+    case 'plot.status':
+      return updateTable(state, action.name, (t) => {
+        const next: TableProgress = {
+          ...t,
+          plotStatuses: { ...t.plotStatuses, [action.index]: action.status },
+        };
+        if (action.error) next.plotErrors = { ...t.plotErrors, [action.index]: action.error };
+        if (action.status === 'rendered' || action.status === 'failed') {
+          next.chartsRendered = Object.values(next.plotStatuses).filter(
+            (s) => s === 'rendered' || s === 'failed',
+          ).length;
+        }
+        next.status = 'visualizing';
+        return next;
+      });
+    case 'chart.rendered':
+      return updateTable(state, action.name, (t) => {
+        const charts = { ...t.charts, [action.index]: action.chart };
+        const plotStatuses = { ...t.plotStatuses, [action.index]: 'rendered' as PlotStatus };
+        return {
+          ...t,
+          charts,
+          plotStatuses,
+          chartsRendered: Object.keys(charts).length,
+          chartsTotal: Math.max(t.chartsTotal, Object.keys(charts).length),
+          status: 'visualizing',
+        };
+      });
     case 'complete':
       return {
         ...state,
@@ -314,33 +378,75 @@ export function useUploadPipeline(options: UploadPipelineOptions = {}) {
           break;
         case 'summary.ready':
           dispatch({ type: 'table.status', name: frame.file_name, status: 'goals' });
+          if (frame.summary) {
+            dispatch({ type: 'table.summary', name: frame.file_name, summary: frame.summary });
+          }
+          break;
+        case 'goals.started':
+          if (frame.n_requested) {
+            dispatch({ type: 'goals.total', name: frame.file_name, total: frame.n_requested });
+          }
+          break;
+        case 'goal.ready':
+          if (frame.goal) {
+            dispatch({
+              type: 'goal.ready',
+              name: frame.file_name,
+              goal: {
+                index: frame.index,
+                question: frame.goal.question || '',
+                visualization: frame.goal.visualization || '',
+                rationale: frame.goal.rationale || '',
+              },
+            });
+            dispatch({ type: 'plot.status', name: frame.file_name, index: frame.index, status: 'pending' });
+          }
           break;
         case 'goals.ready':
           dispatch({ type: 'table.status', name: frame.file_name, status: 'visualizing' });
+          if (typeof frame.count === 'number') {
+            dispatch({ type: 'goals.total', name: frame.file_name, total: frame.count });
+          }
           break;
-        case 'viz.exec.started':
+        case 'plots.started':
+          if (typeof frame.total === 'number') {
+            dispatch({ type: 'goals.total', name: frame.file_name, total: frame.total });
+          }
+          break;
+        case 'plot.started':
           dispatch({
-            type: 'chart.progress',
+            type: 'plot.status',
             name: frame.file_name,
-            rendered: 0,
-            total: frame.total || 0,
+            index: frame.goal_index,
+            status: 'generating',
+          });
+          break;
+        case 'plot.code.ready':
+          dispatch({
+            type: 'plot.status',
+            name: frame.file_name,
+            index: frame.goal_index,
+            status: 'code_ready',
+          });
+          break;
+        case 'plot.failed':
+          dispatch({
+            type: 'plot.status',
+            name: frame.file_name,
+            index: frame.goal_index,
+            status: 'failed',
+            error: frame.error,
           });
           break;
         case 'chart.rendered':
-          dispatch({
-            type: 'chart.progress',
-            name: frame.file_name,
-            rendered: frame.completed,
-            total: frame.total,
-          });
-          break;
-        case 'chart.failed':
-          dispatch({
-            type: 'chart.progress',
-            name: frame.file_name,
-            rendered: frame.completed,
-            total: frame.total,
-          });
+          if (typeof frame.goal_index === 'number' && frame.chart) {
+            dispatch({
+              type: 'chart.rendered',
+              name: frame.file_name,
+              index: frame.goal_index,
+              chart: frame.chart,
+            });
+          }
           break;
         case 'complete':
           dispatch({ type: 'complete', result: frame.data });
@@ -358,7 +464,8 @@ export function useUploadPipeline(options: UploadPipelineOptions = {}) {
   );
 
   const start = useCallback(
-    async (file: File) => {
+    async (file: File, opts: { nGoals?: number } = {}) => {
+      const nGoals = Math.max(1, Math.min(10, Math.round(opts.nGoals ?? 5)));
       dispatch({ type: 'begin', total: file.size });
       let payload: Uint8Array;
       let outName: string;
@@ -393,7 +500,7 @@ export function useUploadPipeline(options: UploadPipelineOptions = {}) {
       await new Promise<void>((resolve) => {
         const xhr = new XMLHttpRequest();
         xhrRef.current = xhr;
-        xhr.open('POST', '/api/v1/summarize/stream');
+        xhr.open('POST', `/api/v1/summarize/stream?n_goals=${nGoals}`);
 
         // responseText grows monotonically. We track how much we've already
         // parsed (`consumedTo`) and on each tick drain any complete `data: ...

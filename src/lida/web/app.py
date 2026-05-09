@@ -137,57 +137,73 @@ def summarize_and_visualize(
     run_visualize: bool,
     emit: Optional[EmitFn] = None,
     chart_workers_cap: Optional[int] = None,
+    n_goals: int = 5,
 ) -> dict:
-    """Run the full summarize -> heuristic goals -> parallel chart pipeline for one tabular file.
+    """Run summarize -> goals -> charts for one tabular file.
 
-    Returns a dict with summary, data_filename, and (if run_visualize) goals + charts.
-    When ``emit`` is provided, intermediate progress events are pushed through
-    it so the SSE endpoint can stream them; the JSON endpoint passes None and
-    behavior is unchanged.
+    Two paths share the same summary stage:
 
-    ``chart_workers_cap`` lets callers limit the per-table ProcessPoolExecutor
-    size when several tables are summarized in parallel — each spawned pool
-    competes for the same CPUs, so callers pass ``cpu_count // n_parallel``.
+    - **Streaming** (``emit`` provided): LLM goals are streamed and parsed
+      incrementally; each closing ``{...}`` immediately submits an LLM viz
+      task to a thread pool, so plot generation runs concurrently with goal
+      generation. Charts execute in a shared process pool. Used by the
+      /summarize/stream SSE endpoint.
+
+    - **JSON** (``emit`` is None): legacy heuristic flow — instant goals via
+      HeuristicGoalExplorer, instant viz codegen, parallel chart execution.
+      Kept for the /summarize endpoint and CLI callers.
     """
     _emit(emit, "summary.started", file_name=display_name)
 
-    # Per-call token sink so concurrent table workers don't share state.
-    # The closure captures display_name; tokens are tagged with file_name so
-    # the frontend can attribute interleaved streams.
-    token_state = {"count": 0, "started_at": time.time()}
+    summary_token_state = {"count": 0, "started_at": time.time()}
 
-    def on_token(delta: str) -> None:
-        token_state["count"] += 1
+    def summary_sink(delta: str) -> None:
+        summary_token_state["count"] += 1
         _emit(
             emit,
             "llm.token",
             file_name=display_name,
+            phase="summary",
             delta=delta,
-            tokens=token_state["count"],
-            elapsed_ms=int((time.time() - token_state["started_at"]) * 1000),
+            tokens=summary_token_state["count"],
+            elapsed_ms=int((time.time() - summary_token_state["started_at"]) * 1000),
         )
 
-    with token_sink(on_token):
+    with token_sink(summary_sink):
         summary = lida.summarize(
             data=file_location,
             file_name=display_name,
             summary_method="llm",
             textgen_config=textgen_config,
         )
-    logger.info("pipeline[%s]: summary ready (%d tokens streamed)", display_name, token_state["count"])
+    logger.info("pipeline[%s]: summary ready (%d tokens)", display_name, summary_token_state["count"])
     _emit(emit, "summary.ready", file_name=display_name, summary=jsonable_encoder(summary))
     result = {"summary": summary, "data_filename": display_name}
 
     if not run_visualize:
         return result
 
-    try:
-        _emit(emit, "goals.started", file_name=display_name)
-        goals = lida.goals(summary, n=20, textgen_config=textgen_config, method="heuristic")
-        logger.info("pipeline[%s]: %d goals generated (heuristic)", display_name, len(goals))
-        _emit(emit, "goals.ready", file_name=display_name, goals=jsonable_encoder(goals))
+    if emit is not None:
+        try:
+            goals, charts = _llm_visualize_pipeline(
+                summary,
+                file_location,
+                display_name,
+                textgen_config,
+                n_goals,
+                emit,
+                chart_workers_cap,
+            )
+            result["goals"] = goals
+            result["charts"] = charts
+        except Exception as exc:
+            logger.error("pipeline[%s]: LLM viz pipeline failed: %s", display_name, exc, exc_info=True)
+            _emit(emit, "table.error", file_name=display_name, error=str(exc))
+        return result
 
-        _emit(emit, "viz.code.started", file_name=display_name, total=len(goals))
+    # JSON endpoint legacy path: heuristic goals + heuristic viz + parallel exec.
+    try:
+        goals = lida.goals(summary, n=20, textgen_config=textgen_config, method="heuristic")
         goals_with_code = []
         for i, goal in enumerate(goals):
             code_list = lida.visualize(
@@ -200,83 +216,242 @@ def summarize_and_visualize(
             )
             if code_list:
                 goals_with_code.append((i, goal, code_list[0]))
-            else:
-                logger.info(f"Failed to generate code for goal {goal.index} (table={display_name})")
-            _emit(
-                emit,
-                "viz.code.progress",
-                file_name=display_name,
-                index=i,
-                total=len(goals),
-                produced=bool(code_list),
-            )
-        logger.info("pipeline[%s]: %d/%d goals produced viz code", display_name, len(goals_with_code), len(goals))
-        _emit(emit, "viz.code.ready", file_name=display_name, count=len(goals_with_code))
-
         charts: list = []
         if goals_with_code:
             data_df = read_dataframe(file_location)
             cpu_budget = chart_workers_cap if chart_workers_cap else (os.cpu_count() or 4)
             max_workers = min(len(goals_with_code), max(1, cpu_budget))
             ctx = multiprocessing.get_context("spawn")
-            _emit(
-                emit,
-                "viz.exec.started",
-                file_name=display_name,
-                workers=max_workers,
-                total=len(goals_with_code),
-            )
             with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
-                future_to_index = {executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal) for i, goal, code in goals_with_code}
+                future_to_index = {
+                    executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal)
+                    for i, goal, code in goals_with_code
+                }
                 rendered = []
-                completed = 0
                 for future in as_completed(future_to_index):
-                    i, goal = future_to_index[future]
-                    completed += 1
+                    i, _ = future_to_index[future]
                     try:
                         chart_executed = future.result()
                         if chart_executed:
                             rendered.append((i, chart_executed[0]))
-                            _emit(
-                                emit,
-                                "chart.rendered",
-                                file_name=display_name,
-                                index=i,
-                                completed=completed,
-                                total=len(goals_with_code),
-                                chart=jsonable_encoder(chart_executed[0]),
-                            )
-                        else:
-                            _emit(
-                                emit,
-                                "chart.failed",
-                                file_name=display_name,
-                                index=i,
-                                completed=completed,
-                                total=len(goals_with_code),
-                                error="empty result",
-                            )
                     except Exception as exc:
-                        logger.warning(f"Chart exception for goal {goal.index} (table={display_name}): {exc}")
-                        _emit(
-                            emit,
-                            "chart.failed",
-                            file_name=display_name,
-                            index=i,
-                            completed=completed,
-                            total=len(goals_with_code),
-                            error=str(exc),
-                        )
+                        logger.warning("Chart exception (idx %d, table=%s): %s", i, display_name, exc)
                 rendered.sort(key=lambda x: x[0])
                 charts = [r[1] for r in rendered]
-        logger.info("pipeline[%s]: rendered %d/%d charts", display_name, len(charts), len(goals_with_code))
         result["goals"] = goals
         result["charts"] = charts
     except Exception as exc:
-        logger.error(f"Heuristic flow error for {display_name}: {exc}")
-        logger.debug(traceback.format_exc())
-        _emit(emit, "table.error", file_name=display_name, error=str(exc))
+        logger.error("Heuristic flow error for %s: %s", display_name, exc)
     return result
+
+
+def _llm_visualize_pipeline(
+    summary,
+    file_location: str,
+    display_name: str,
+    textgen_config: TextGenerationConfig,
+    n_goals: int,
+    emit: EmitFn,
+    chart_workers_cap: Optional[int],
+) -> tuple:
+    """Streaming LLM goals + pipelined parallel plot generation.
+
+    The streaming token sink for the goals call routes deltas through
+    _GoalStreamParser. Each closing ``{...}`` immediately submits a plot
+    task to ``plot_pool`` (LLM viz call lives in this thread). Chart
+    execution is offloaded to a shared ``chart_pool`` (matplotlib state
+    is not thread-safe). Plot tasks run concurrently with later goals
+    still being streamed by the model.
+    """
+    from lida.domain.models import Goal as DomainGoal
+
+    parser = _GoalStreamParser()
+    goals_streamed: list = []
+    plot_futures: dict = {}
+
+    cpu_budget = chart_workers_cap if chart_workers_cap else (os.cpu_count() or 4)
+    chart_pool_size = max(1, min(n_goals, cpu_budget))
+    plot_pool_size = max(2, min(n_goals, cpu_budget * 2))  # LLM is I/O-bound; over-thread is fine
+
+    ctx = multiprocessing.get_context("spawn")
+    chart_pool = ProcessPoolExecutor(max_workers=chart_pool_size, mp_context=ctx)
+    plot_pool = ThreadPoolExecutor(
+        max_workers=plot_pool_size,
+        thread_name_prefix=f"lida-plot-{display_name[:8]}",
+    )
+
+    data_df = read_dataframe(file_location)
+
+    goal_token_state = {"count": 0, "started_at": time.time()}
+
+    def goal_sink(delta: str) -> None:
+        goal_token_state["count"] += 1
+        _emit(
+            emit,
+            "llm.token",
+            file_name=display_name,
+            phase="goals",
+            delta=delta,
+            tokens=goal_token_state["count"],
+            elapsed_ms=int((time.time() - goal_token_state["started_at"]) * 1000),
+        )
+        for goal_dict in parser.feed(delta):
+            idx = len(goals_streamed)
+            try:
+                goal = DomainGoal(
+                    question=goal_dict.get("question", ""),
+                    visualization=goal_dict.get("visualization", ""),
+                    rationale=goal_dict.get("rationale", ""),
+                    index=idx,
+                )
+            except Exception as exc:
+                logger.warning("pipeline[%s]: streamed goal[%d] malformed: %s", display_name, idx, exc)
+                continue
+            goals_streamed.append(goal)
+            _emit(
+                emit,
+                "goal.ready",
+                file_name=display_name,
+                index=idx,
+                goal=jsonable_encoder(goal),
+            )
+            # Pipeline: kick off plot generation immediately, don't wait for
+            # subsequent goals.
+            future = plot_pool.submit(
+                _run_plot_task,
+                idx, goal, summary, data_df, display_name,
+                textgen_config, emit, chart_pool,
+            )
+            plot_futures[idx] = future
+
+    try:
+        _emit(emit, "goals.started", file_name=display_name, n_requested=n_goals)
+        try:
+            with token_sink(goal_sink):
+                final_goals = lida.goals(summary, n=n_goals, textgen_config=textgen_config)
+        except Exception as exc:
+            logger.error("pipeline[%s]: goal LLM call failed: %s", display_name, exc, exc_info=True)
+            _emit(emit, "goals.error", file_name=display_name, error=str(exc))
+            final_goals = goals_streamed
+        logger.info(
+            "pipeline[%s]: %d goals (%d via streaming, %d tokens)",
+            display_name, len(final_goals), len(goals_streamed), goal_token_state["count"],
+        )
+        _emit(emit, "goals.ready", file_name=display_name, count=len(final_goals))
+
+        # Edge case: adapter parse caught goals our streaming tracker missed.
+        for i, goal in enumerate(final_goals):
+            if i not in plot_futures:
+                logger.info("pipeline[%s]: late-submitting plot[%d] missed by streamer", display_name, i)
+                future = plot_pool.submit(
+                    _run_plot_task,
+                    i, goal, summary, data_df, display_name,
+                    textgen_config, emit, chart_pool,
+                )
+                plot_futures[i] = future
+
+        _emit(emit, "plots.started", file_name=display_name, total=len(plot_futures))
+        chart_results: dict = {}
+        for fut in as_completed(list(plot_futures.values())):
+            try:
+                idx, chart = fut.result()
+                if chart is not None:
+                    chart_results[idx] = chart
+            except Exception as exc:
+                logger.warning("pipeline[%s]: plot task crashed: %s", display_name, exc)
+
+        ordered_charts = [chart_results[i] for i in sorted(chart_results.keys())]
+        logger.info(
+            "pipeline[%s]: %d/%d charts rendered",
+            display_name, len(ordered_charts), len(plot_futures),
+        )
+        return final_goals, ordered_charts
+    finally:
+        plot_pool.shutdown(wait=True)
+        chart_pool.shutdown(wait=True)
+
+
+def _run_plot_task(
+    goal_index: int,
+    goal,
+    summary,
+    data_df,
+    display_name: str,
+    textgen_config: TextGenerationConfig,
+    emit: EmitFn,
+    chart_pool: ProcessPoolExecutor,
+) -> tuple:
+    """Per-goal worker: LLM viz code generation -> chart execution.
+
+    Runs in a thread (LLM call is HTTP I/O so the GIL is friendly). Chart
+    execution is dispatched to ``chart_pool`` because user-generated
+    matplotlib code is not safe to run concurrently in threads.
+    """
+    _emit(
+        emit,
+        "plot.started",
+        file_name=display_name,
+        goal_index=goal_index,
+        question=getattr(goal, "question", ""),
+    )
+
+    plot_token_state = {"count": 0, "started_at": time.time()}
+
+    def plot_sink(delta: str) -> None:
+        plot_token_state["count"] += 1
+        _emit(
+            emit,
+            "llm.token",
+            file_name=display_name,
+            phase="plot",
+            goal_index=goal_index,
+            delta=delta,
+            tokens=plot_token_state["count"],
+            elapsed_ms=int((time.time() - plot_token_state["started_at"]) * 1000),
+        )
+
+    try:
+        with token_sink(plot_sink):
+            code_list = lida.visualize(
+                summary=summary,
+                goal=goal,
+                textgen_config=textgen_config,
+                library="seaborn",
+                return_error=True,
+            )
+    except Exception as exc:
+        logger.warning("plot[%s/%d]: LLM call failed: %s", display_name, goal_index, exc)
+        _emit(emit, "plot.failed", file_name=display_name, goal_index=goal_index, error=str(exc))
+        return goal_index, None
+
+    if not code_list:
+        _emit(emit, "plot.failed", file_name=display_name, goal_index=goal_index, error="no code generated")
+        return goal_index, None
+
+    code = code_list[0]
+    _emit(emit, "plot.code.ready", file_name=display_name, goal_index=goal_index)
+
+    try:
+        future = chart_pool.submit(execute_chart_worker, code, data_df, summary, "seaborn")
+        chart_executed = future.result()
+    except Exception as exc:
+        logger.warning("plot[%s/%d]: chart exec failed: %s", display_name, goal_index, exc)
+        _emit(emit, "plot.failed", file_name=display_name, goal_index=goal_index, error=str(exc))
+        return goal_index, None
+
+    if not chart_executed:
+        _emit(emit, "plot.failed", file_name=display_name, goal_index=goal_index, error="exec returned empty")
+        return goal_index, None
+
+    chart = chart_executed[0]
+    _emit(
+        emit,
+        "chart.rendered",
+        file_name=display_name,
+        goal_index=goal_index,
+        chart=jsonable_encoder(chart),
+    )
+    return goal_index, chart
 
 
 @api.post("/visualize")
@@ -703,6 +878,7 @@ async def upload_file(
 async def upload_file_stream(
     file: UploadFile,
     visualize: bool = os.environ.get("LIDA_MO_INSTANT_ANALYSIS", "true").lower() == "true",
+    n_goals: int = 5,
 ):
     """Streaming variant of /summarize that pushes per-stage progress events.
 
@@ -726,8 +902,10 @@ async def upload_file_stream(
     with open(saved_path, "wb") as f:
         f.write(contents)
 
+    n_goals = max(1, min(10, int(n_goals)))
+
     return StreamingResponse(
-        _stream_pipeline(saved_path, upload_filename, visualize),
+        _stream_pipeline(saved_path, upload_filename, visualize, n_goals),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -795,9 +973,9 @@ async def _sse_streaming_response(run_sync: Callable[[EmitFn], None]):
                 pass
 
 
-async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: bool):
+async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: bool, n_goals: int):
     def run(emit: EmitFn) -> None:
-        _run_streaming_pipeline(saved_path, upload_filename, visualize, emit)
+        _run_streaming_pipeline(saved_path, upload_filename, visualize, n_goals, emit)
     async for chunk in _sse_streaming_response(run):
         yield chunk
 
@@ -806,6 +984,7 @@ def _run_streaming_pipeline(
     saved_path: str,
     upload_filename: str,
     visualize: bool,
+    n_goals: int,
     emit: EmitFn,
 ) -> None:
     """Synchronous pipeline body, called inside asyncio.to_thread().
@@ -832,7 +1011,7 @@ def _run_streaming_pipeline(
     # parallel summarizers tag tokens with file_name. We just run the dispatch.
     try:
         entries = _process_uploaded_file(
-            file_location, display_name, textgen_config, visualize, emit=emit
+            file_location, display_name, textgen_config, visualize, emit=emit, n_goals=n_goals,
         )
     except Exception as exc:
         emit("stage", {"stage": "analyze", "status": "error", "message": str(exc)})
@@ -894,16 +1073,17 @@ def _process_uploaded_file(
     textgen_config: TextGenerationConfig,
     run_visualize: bool,
     emit: Optional[EmitFn] = None,
+    n_goals: int = 5,
 ) -> list:
     """Dispatch on file kind, returning a flat list of per-dataset result dicts."""
     if is_sqlite_file(file_location):
         _emit(emit, "dispatch", kind="sqlite", file_name=display_name)
-        return _sqlite_entries(file_location, display_name, textgen_config, run_visualize, emit=emit)
+        return _sqlite_entries(file_location, display_name, textgen_config, run_visualize, emit=emit, n_goals=n_goals)
     if is_tar_archive(file_location):
         _emit(emit, "dispatch", kind="tar", file_name=display_name)
-        return _tar_entries(file_location, display_name, textgen_config, run_visualize, emit=emit)
+        return _tar_entries(file_location, display_name, textgen_config, run_visualize, emit=emit, n_goals=n_goals)
     _emit(emit, "dispatch", kind="single", file_name=display_name)
-    return [summarize_and_visualize(file_location, display_name, textgen_config, run_visualize, emit=emit)]
+    return [summarize_and_visualize(file_location, display_name, textgen_config, run_visualize, emit=emit, n_goals=n_goals)]
 
 
 TABLE_CONCURRENCY = max(1, int(os.environ.get("LIDA_TABLE_CONCURRENCY", "4")))
@@ -914,6 +1094,7 @@ def _run_tables_in_parallel(
     textgen_config: TextGenerationConfig,
     run_visualize: bool,
     emit: Optional[EmitFn],
+    n_goals: int = 5,
 ) -> list:
     """Fan out summarize_and_visualize across multiple tables concurrently.
 
@@ -944,6 +1125,7 @@ def _run_tables_in_parallel(
                 run_visualize,
                 emit=emit,
                 chart_workers_cap=chart_workers_cap,
+                n_goals=n_goals,
             )
             entry["table_name"] = label
             _emit(emit, "table.done", name=label)
@@ -974,6 +1156,7 @@ def _sqlite_entries(
     textgen_config: TextGenerationConfig,
     run_visualize: bool,
     emit: Optional[EmitFn] = None,
+    n_goals: int = 5,
 ) -> list:
     """Materialize each user table as a CSV, then run the standard pipeline per table."""
     tables = read_sqlite_tables(file_location)
@@ -993,7 +1176,7 @@ def _sqlite_entries(
         csv_path = os.path.join(data_folder, csv_filename)
         df.to_csv(csv_path, index=False)
         units.append((table_name, csv_path, csv_filename))
-    return _run_tables_in_parallel(units, textgen_config, run_visualize, emit)
+    return _run_tables_in_parallel(units, textgen_config, run_visualize, emit, n_goals=n_goals)
 
 
 def _tar_entries(
@@ -1002,6 +1185,7 @@ def _tar_entries(
     textgen_config: TextGenerationConfig,
     run_visualize: bool,
     emit: Optional[EmitFn] = None,
+    n_goals: int = 5,
 ) -> list:
     """Extract each regular file from a tar archive and run the pipeline.
 
@@ -1033,14 +1217,14 @@ def _tar_entries(
             else:
                 units.append((base_name, dest_path, base_name))
 
-    parallel_results = _run_tables_in_parallel(units, textgen_config, run_visualize, emit)
+    parallel_results = _run_tables_in_parallel(units, textgen_config, run_visualize, emit, n_goals=n_goals)
 
     sequential_results: list = []
     for base_name, dest_path in sequential_targets:
         _emit(emit, "table.started", name=base_name)
         try:
             sub_entries = _process_uploaded_file(
-                dest_path, base_name, textgen_config, run_visualize, emit=emit
+                dest_path, base_name, textgen_config, run_visualize, emit=emit, n_goals=n_goals,
             )
         except Exception as exc:
             logger.warning(f"Skipping tar entry {base_name}: {exc}")
