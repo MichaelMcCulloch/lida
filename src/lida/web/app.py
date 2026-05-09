@@ -12,7 +12,7 @@ import multiprocessing
 import matplotlib
 
 matplotlib.use("Agg")  # Ensure headless execution
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 from fastapi import FastAPI, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -136,6 +136,7 @@ def summarize_and_visualize(
     textgen_config: TextGenerationConfig,
     run_visualize: bool,
     emit: Optional[EmitFn] = None,
+    chart_workers_cap: Optional[int] = None,
 ) -> dict:
     """Run the full summarize -> heuristic goals -> parallel chart pipeline for one tabular file.
 
@@ -143,14 +144,37 @@ def summarize_and_visualize(
     When ``emit`` is provided, intermediate progress events are pushed through
     it so the SSE endpoint can stream them; the JSON endpoint passes None and
     behavior is unchanged.
+
+    ``chart_workers_cap`` lets callers limit the per-table ProcessPoolExecutor
+    size when several tables are summarized in parallel — each spawned pool
+    competes for the same CPUs, so callers pass ``cpu_count // n_parallel``.
     """
     _emit(emit, "summary.started", file_name=display_name)
-    summary = lida.summarize(
-        data=file_location,
-        file_name=display_name,
-        summary_method="llm",
-        textgen_config=textgen_config,
-    )
+
+    # Per-call token sink so concurrent table workers don't share state.
+    # The closure captures display_name; tokens are tagged with file_name so
+    # the frontend can attribute interleaved streams.
+    token_state = {"count": 0, "started_at": time.time()}
+
+    def on_token(delta: str) -> None:
+        token_state["count"] += 1
+        _emit(
+            emit,
+            "llm.token",
+            file_name=display_name,
+            delta=delta,
+            tokens=token_state["count"],
+            elapsed_ms=int((time.time() - token_state["started_at"]) * 1000),
+        )
+
+    with token_sink(on_token):
+        summary = lida.summarize(
+            data=file_location,
+            file_name=display_name,
+            summary_method="llm",
+            textgen_config=textgen_config,
+        )
+    logger.info("pipeline[%s]: summary ready (%d tokens streamed)", display_name, token_state["count"])
     _emit(emit, "summary.ready", file_name=display_name, summary=jsonable_encoder(summary))
     result = {"summary": summary, "data_filename": display_name}
 
@@ -160,6 +184,7 @@ def summarize_and_visualize(
     try:
         _emit(emit, "goals.started", file_name=display_name)
         goals = lida.goals(summary, n=20, textgen_config=textgen_config, method="heuristic")
+        logger.info("pipeline[%s]: %d goals generated (heuristic)", display_name, len(goals))
         _emit(emit, "goals.ready", file_name=display_name, goals=jsonable_encoder(goals))
 
         _emit(emit, "viz.code.started", file_name=display_name, total=len(goals))
@@ -185,12 +210,14 @@ def summarize_and_visualize(
                 total=len(goals),
                 produced=bool(code_list),
             )
+        logger.info("pipeline[%s]: %d/%d goals produced viz code", display_name, len(goals_with_code), len(goals))
         _emit(emit, "viz.code.ready", file_name=display_name, count=len(goals_with_code))
 
         charts: list = []
         if goals_with_code:
             data_df = read_dataframe(file_location)
-            max_workers = min(len(goals_with_code), os.cpu_count() or 4)
+            cpu_budget = chart_workers_cap if chart_workers_cap else (os.cpu_count() or 4)
+            max_workers = min(len(goals_with_code), max(1, cpu_budget))
             ctx = multiprocessing.get_context("spawn")
             _emit(
                 emit,
@@ -242,6 +269,7 @@ def summarize_and_visualize(
                         )
                 rendered.sort(key=lambda x: x[0])
                 charts = [r[1] for r in rendered]
+        logger.info("pipeline[%s]: rendered %d/%d charts", display_name, len(charts), len(goals_with_code))
         result["goals"] = goals
         result["charts"] = charts
     except Exception as exc:
@@ -553,6 +581,9 @@ def _sse_frame(event: str, payload: dict) -> bytes:
     return f"data: {json.dumps(body, default=str)}\n\n".encode("utf-8")
 
 
+SSE_KEEPALIVE_INTERVAL_S = 5.0
+
+
 async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: bool):
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -576,7 +607,15 @@ async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: boo
 
     try:
         while True:
-            item = await queue.get()
+            try:
+                # Keepalive while the pipeline is quiet: an SSE comment every
+                # few seconds prevents buffering proxies (nginx, Vite, k8s
+                # ingress) from holding bytes back during gaps between the
+                # LLM stream and the heuristic goals/viz phases.
+                item = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_INTERVAL_S)
+            except asyncio.TimeoutError:
+                yield b": keepalive\n\n"
+                continue
             if item is sentinel:
                 yield _sse_frame("done", {})
                 return
@@ -617,29 +656,18 @@ def _run_streaming_pipeline(
 
     emit("stage", {"stage": "analyze", "status": "start", "label": "Analyzing dataset"})
 
-    token_state = {"count": 0, "started_at": time.time()}
-
-    def on_token(delta: str) -> None:
-        token_state["count"] += 1
-        emit(
-            "llm.token",
-            {
-                "delta": delta,
-                "tokens": token_state["count"],
-                "elapsed_ms": int((time.time() - token_state["started_at"]) * 1000),
-            },
-        )
-
+    # Token sinks are now installed per-table inside summarize_and_visualize so
+    # parallel summarizers tag tokens with file_name. We just run the dispatch.
     try:
-        with token_sink(on_token):
-            entries = _process_uploaded_file(
-                file_location, display_name, textgen_config, visualize, emit=emit
-            )
+        entries = _process_uploaded_file(
+            file_location, display_name, textgen_config, visualize, emit=emit
+        )
     except Exception as exc:
         emit("stage", {"stage": "analyze", "status": "error", "message": str(exc)})
         raise
 
-    emit("stage", {"stage": "analyze", "status": "done", "tokens_total": token_state["count"]})
+    emit("stage", {"stage": "analyze", "status": "done"})
+    logger.info("pipeline: analyze stage complete, building final payload")
 
     if not entries:
         emit("error", {"message": "No tabular data found in upload."})
@@ -656,6 +684,7 @@ def _run_streaming_pipeline(
         }
 
     emit("complete", {"data": jsonable_encoder(complete_payload)})
+    logger.info("pipeline: emitted complete event")
 
 
 def _decompress_if_gzipped(saved_path: str, original_filename: str) -> tuple[str, str]:
@@ -705,6 +734,68 @@ def _process_uploaded_file(
     return [summarize_and_visualize(file_location, display_name, textgen_config, run_visualize, emit=emit)]
 
 
+TABLE_CONCURRENCY = max(1, int(os.environ.get("LIDA_TABLE_CONCURRENCY", "4")))
+
+
+def _run_tables_in_parallel(
+    units: list,
+    textgen_config: TextGenerationConfig,
+    run_visualize: bool,
+    emit: Optional[EmitFn],
+) -> list:
+    """Fan out summarize_and_visualize across multiple tables concurrently.
+
+    ``units`` is a list of tuples ``(label, csv_path, display_filename)`` where
+    ``label`` is the per-table name surfaced through table.started/done events.
+    Concurrency is bounded by LIDA_TABLE_CONCURRENCY (default 4); per-table
+    chart pools are sized to share CPU rather than oversubscribe.
+    """
+    n = len(units)
+    if n == 0:
+        return []
+    parallelism = min(n, TABLE_CONCURRENCY)
+    chart_workers_cap = max(1, (os.cpu_count() or 4) // parallelism)
+    logger.info(
+        "pipeline: dispatching %d tables across %d workers (chart cap %d/table)",
+        n, parallelism, chart_workers_cap,
+    )
+
+    results: dict = {}
+
+    def worker(label: str, csv_path: str, display_filename: str) -> tuple:
+        _emit(emit, "table.started", name=label)
+        try:
+            entry = summarize_and_visualize(
+                csv_path,
+                display_filename,
+                textgen_config,
+                run_visualize,
+                emit=emit,
+                chart_workers_cap=chart_workers_cap,
+            )
+            entry["table_name"] = label
+            _emit(emit, "table.done", name=label)
+            return label, entry, None
+        except Exception as exc:
+            logger.warning("table %s failed: %s", label, exc)
+            _emit(emit, "table.error", name=label, error=str(exc))
+            return label, None, exc
+
+    with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="lida-table") as ex:
+        futures = [ex.submit(worker, *u) for u in units]
+        for fut in as_completed(futures):
+            label, entry, exc = fut.result()
+            if entry is not None:
+                results[label] = entry
+
+    # Preserve original input order in the response.
+    ordered = []
+    for label, _, _ in units:
+        if label in results:
+            ordered.append(results[label])
+    return ordered
+
+
 def _sqlite_entries(
     file_location: str,
     db_filename: str,
@@ -724,17 +815,13 @@ def _sqlite_entries(
         names=list(tables.keys()),
     )
     stem, _ = os.path.splitext(db_filename)
-    results: list = []
+    units = []
     for table_name, df in tables.items():
         csv_filename = f"{stem}__{table_name}.csv"
         csv_path = os.path.join(data_folder, csv_filename)
         df.to_csv(csv_path, index=False)
-        _emit(emit, "table.started", name=table_name)
-        per_table = summarize_and_visualize(csv_path, csv_filename, textgen_config, run_visualize, emit=emit)
-        per_table["table_name"] = table_name
-        _emit(emit, "table.done", name=table_name)
-        results.append(per_table)
-    return results
+        units.append((table_name, csv_path, csv_filename))
+    return _run_tables_in_parallel(units, textgen_config, run_visualize, emit)
 
 
 def _tar_entries(
@@ -744,41 +831,55 @@ def _tar_entries(
     run_visualize: bool,
     emit: Optional[EmitFn] = None,
 ) -> list:
-    """Extract each regular file from a tar archive and recursively process it.
+    """Extract each regular file from a tar archive and run the pipeline.
 
     Sanitizes member names to defeat path traversal and skips directories,
-    symlinks, and dotfiles.
+    symlinks, and dotfiles. Tabular members are run concurrently. Recursive
+    members (a sqlite or another tar inside the archive) fall back to the
+    sequential dispatch and are appended in extraction order.
     """
-    results: list = []
+    units: list = []
+    sequential_targets: list = []
     with tarfile.open(file_location, "r") as tf:
         members = [m for m in tf.getmembers() if m.isreg()]
-        names = [os.path.basename(m.name) for m in members]
-        names = [n for n in names if n and not n.startswith(".")]
+        keep = [m for m in members if os.path.basename(m.name) and not os.path.basename(m.name).startswith(".")]
+        names = [os.path.basename(m.name) for m in keep]
         _emit(emit, "tables.detected", kind="tar", count=len(names), names=names)
-        for member in members:
+        for member in keep:
             base_name = os.path.basename(member.name)
-            if not base_name or base_name.startswith("."):
-                continue
             dest_path = os.path.join(data_folder, base_name)
             src = tf.extractfile(member)
             if src is None:
                 continue
             with open(dest_path, "wb") as out:
                 shutil.copyfileobj(src, out)
-            _emit(emit, "table.started", name=base_name)
-            try:
-                sub_entries = _process_uploaded_file(
-                    dest_path, base_name, textgen_config, run_visualize, emit=emit
-                )
-            except Exception as exc:
-                logger.warning(f"Skipping tar entry {base_name}: {exc}")
-                _emit(emit, "table.error", name=base_name, error=str(exc))
-                continue
-            for entry in sub_entries:
-                entry.setdefault("table_name", base_name)
-                results.append(entry)
-            _emit(emit, "table.done", name=base_name)
-    return results
+            # Only tabular files run through summarize_and_visualize directly;
+            # nested sqlite/tar archives need recursive dispatch and stay
+            # sequential to keep the event ordering predictable.
+            if is_sqlite_file(dest_path) or is_tar_archive(dest_path):
+                sequential_targets.append((base_name, dest_path))
+            else:
+                units.append((base_name, dest_path, base_name))
+
+    parallel_results = _run_tables_in_parallel(units, textgen_config, run_visualize, emit)
+
+    sequential_results: list = []
+    for base_name, dest_path in sequential_targets:
+        _emit(emit, "table.started", name=base_name)
+        try:
+            sub_entries = _process_uploaded_file(
+                dest_path, base_name, textgen_config, run_visualize, emit=emit
+            )
+        except Exception as exc:
+            logger.warning(f"Skipping tar entry {base_name}: {exc}")
+            _emit(emit, "table.error", name=base_name, error=str(exc))
+            continue
+        for entry in sub_entries:
+            entry.setdefault("table_name", base_name)
+            sequential_results.append(entry)
+        _emit(emit, "table.done", name=base_name)
+
+    return parallel_results + sequential_results
 
 
 # upload via url
