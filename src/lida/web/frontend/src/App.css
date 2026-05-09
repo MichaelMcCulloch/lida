@@ -660,3 +660,32 @@
   font-size: 0.75rem;
   color: #fca5a5;
 }
+
+/* Goal generator streaming feedback */
+
+.goal-stream {
+  margin: 1.25rem auto;
+  max-width: 720px;
+  text-align: left;
+}
+
+.goal-stream__error {
+  margin: 1rem auto;
+  max-width: 720px;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+  font-size: 0.9rem;
+  text-align: left;
+}
+
+.goal-card {
+  animation: goal-card-pop 0.25s ease-out;
+}
+
+@keyframes goal-card-pop {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}

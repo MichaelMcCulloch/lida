@@ -13,7 +13,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # Ensure headless execution
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 from fastapi import FastAPI, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
@@ -500,6 +500,166 @@ async def generate_goal(req: GoalWebRequest) -> dict:
         }
 
 
+@api.post("/goal/stream")
+async def generate_goal_stream(req: GoalWebRequest):
+    """Streaming variant of /goal that pushes stage + llm.token events.
+
+    Body matches /goal exactly. The response is text/event-stream and emits
+    the same shape as /summarize/stream: ``stage``, ``llm.token``, ``goals``,
+    ``complete``, ``done``. The frontend can consume both endpoints with the
+    same SSE parser.
+    """
+    def run(emit: EmitFn) -> None:
+        _run_goal_stream(req, emit)
+
+    return StreamingResponse(
+        _sse_streaming_response(run),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+class _GoalStreamParser:
+    """Incremental JSON-array parser that yields goal objects as they close.
+
+    Walks the streamed text once, tracking brace depth, string state, and
+    the position of the open ``{`` for each top-level object. When depth
+    returns to zero, the closed substring is parsed as JSON and yielded.
+    State is preserved across feed() calls so we don't rescan from the
+    beginning each time.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = ""
+        self.scan = 0
+        self.array_open = False
+        self.depth = 0
+        self.in_str = False
+        self.escape = False
+        self.obj_start = -1
+
+    def feed(self, delta: str) -> List[Dict]:
+        self.buffer += delta
+        out: List[Dict] = []
+        n = len(self.buffer)
+        i = self.scan
+        while i < n:
+            c = self.buffer[i]
+            if not self.array_open:
+                if c == "[":
+                    self.array_open = True
+                i += 1
+                continue
+            if self.in_str:
+                if self.escape:
+                    self.escape = False
+                elif c == "\\":
+                    self.escape = True
+                elif c == '"':
+                    self.in_str = False
+            else:
+                if c == '"':
+                    self.in_str = True
+                elif c == "{":
+                    if self.depth == 0:
+                        self.obj_start = i
+                    self.depth += 1
+                elif c == "}":
+                    self.depth -= 1
+                    if self.depth == 0 and self.obj_start >= 0:
+                        snippet = self.buffer[self.obj_start : i + 1]
+                        try:
+                            out.append(json.loads(snippet))
+                        except json.JSONDecodeError:
+                            # Partial JSON; the final adapter parse will catch
+                            # whatever the streaming pass missed.
+                            pass
+                        self.obj_start = -1
+                elif c == "]" and self.depth == 0:
+                    # End of array; stop scanning.
+                    i = n
+                    break
+            i += 1
+        self.scan = i
+        return out
+
+
+def _run_goal_stream(req: GoalWebRequest, emit: EmitFn) -> None:
+    """Synchronous goal-generation pipeline body for the SSE endpoint.
+
+    Parses streamed tokens incrementally so each goal is surfaced via a
+    ``goal.ready`` event the moment its closing brace arrives — the user
+    sees goals appear one at a time instead of waiting for the full array.
+    """
+    emit("stage", {"stage": "goals", "status": "start", "label": "Generating goals"})
+
+    token_state = {"count": 0, "started_at": time.time()}
+    parser = _GoalStreamParser()
+    streamed_count = {"n": 0}
+
+    def on_token(delta: str) -> None:
+        token_state["count"] += 1
+        emit(
+            "llm.token",
+            {
+                "delta": delta,
+                "tokens": token_state["count"],
+                "elapsed_ms": int((time.time() - token_state["started_at"]) * 1000),
+            },
+        )
+        for goal in parser.feed(delta):
+            emit(
+                "goal.ready",
+                {
+                    "index": streamed_count["n"],
+                    "goal": jsonable_encoder(goal),
+                },
+            )
+            streamed_count["n"] += 1
+
+    textgen_config = req.textgen_config if req.textgen_config else TextGenerationConfig()
+    method = req.method or "default"
+
+    try:
+        with token_sink(on_token):
+            goals = lida.goals(
+                req.summary,
+                n=req.n,
+                textgen_config=textgen_config,
+                method=method,
+            )
+    except Exception as exc:
+        logger.error("goal stream failed: %s", exc, exc_info=True)
+        msg = str(exc)
+        if "context length" in msg.lower():
+            msg = "The dataset has too many columns. Please reduce columns and try again."
+        emit("stage", {"stage": "goals", "status": "error", "message": msg})
+        emit("error", {"message": msg})
+        return
+
+    logger.info(
+        "goal stream: %d goals generated (%d tokens, %d streamed incrementally)",
+        len(goals), token_state["count"], streamed_count["n"],
+    )
+    # Final authoritative list — emitted after the adapter's own JSON parse,
+    # which has more lenient cleanup than our streaming brace tracker.
+    emit("goals", {"data": jsonable_encoder(goals)})
+    emit("stage", {"stage": "goals", "status": "done", "tokens_total": token_state["count"]})
+    emit(
+        "complete",
+        {
+            "data": {
+                "status": True,
+                "data": jsonable_encoder(goals),
+                "message": f"Successfully generated {len(goals)} goals",
+            }
+        },
+    )
+
+
 @api.post("/summarize")
 async def upload_file(
     file: UploadFile,
@@ -584,34 +744,39 @@ def _sse_frame(event: str, payload: dict) -> bytes:
 SSE_KEEPALIVE_INTERVAL_S = 5.0
 
 
-async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: bool):
+async def _sse_streaming_response(run_sync: Callable[[EmitFn], None]):
+    """Generic SSE wrapper.
+
+    ``run_sync`` is a synchronous callable that takes an ``emit(event, payload)``
+    function and produces work. We run it in a worker thread, drain its emitted
+    events through an asyncio.Queue, and yield SSE frames. A ``: keepalive``
+    comment every few seconds prevents buffering proxies (nginx, Vite, k8s
+    ingress) from holding bytes back during quiet stretches.
+    """
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     sentinel = object()
 
     def emit(event: str, payload: dict) -> None:
-        # Worker thread -> async queue. call_soon_threadsafe is required because
-        # the sync pipeline runs in asyncio.to_thread(), not on the event loop.
+        # Worker thread -> async queue. call_soon_threadsafe is required
+        # because the sync pipeline runs in asyncio.to_thread(), not on the
+        # event loop.
         loop.call_soon_threadsafe(queue.put_nowait, (event, payload))
 
-    def run_pipeline() -> None:
+    def run() -> None:
         try:
-            _run_streaming_pipeline(saved_path, upload_filename, visualize, emit)
+            run_sync(emit)
         except Exception as exc:
-            logger.error("streaming pipeline crashed: %s", exc, exc_info=True)
+            logger.error("SSE pipeline crashed: %s", exc, exc_info=True)
             emit("error", {"message": str(exc)})
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, sentinel)
 
-    pipeline_task = asyncio.create_task(asyncio.to_thread(run_pipeline))
+    pipeline_task = asyncio.create_task(asyncio.to_thread(run))
 
     try:
         while True:
             try:
-                # Keepalive while the pipeline is quiet: an SSE comment every
-                # few seconds prevents buffering proxies (nginx, Vite, k8s
-                # ingress) from holding bytes back during gaps between the
-                # LLM stream and the heuristic goals/viz phases.
                 item = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_INTERVAL_S)
             except asyncio.TimeoutError:
                 yield b": keepalive\n\n"
@@ -628,6 +793,13 @@ async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: boo
                 await pipeline_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: bool):
+    def run(emit: EmitFn) -> None:
+        _run_streaming_pipeline(saved_path, upload_filename, visualize, emit)
+    async for chunk in _sse_streaming_response(run):
+        yield chunk
 
 
 def _run_streaming_pipeline(
