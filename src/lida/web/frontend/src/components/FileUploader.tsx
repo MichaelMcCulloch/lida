@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
-import pako from 'pako';
+import React, { useCallback, useState } from 'react';
+import { useUploadPipeline } from '../hooks/useUploadPipeline';
+import { PipelineProgress } from './PipelineProgress';
 
 interface FileUploaderProps {
   onSuccess: (summary: any) => void;
@@ -7,96 +8,97 @@ interface FileUploaderProps {
 }
 
 export const FileUploader: React.FC<FileUploaderProps> = ({ onSuccess, onError }) => {
-  const [loading, setLoading] = useState(false);
-
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (!e.target.files?.length) return;
-
-    const file = e.target.files[0];
-    setLoading(true);
-
-    try {
-      const arrayBuffer = await file.arrayBuffer();
-      const bytes = new Uint8Array(arrayBuffer);
-      const isAlreadyGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
-
-      const formData = new FormData();
-      if (isAlreadyGzip) {
-        // Pass through; the file already has a .gz signature. Ensure the name
-        // ends with .gz so the server's decompress step picks it up.
-        const gzName = /\.gz$/i.test(file.name) ? file.name : `${file.name}.gz`;
-        formData.append('file', file, gzName);
-      } else {
-        const compressed = pako.gzip(bytes, { level: 9 });
-        const compressedBlob = new Blob([compressed], { type: 'application/gzip' });
-        formData.append('file', compressedBlob, `${file.name}.gz`);
-      }
-
-      const res = await fetch('/api/v1/summarize', {
-        method: 'POST',
-        body: formData,
-      });
-      const data = await res.json();
-
-      if (data.status) {
+  const [urlBusy, setUrlBusy] = useState(false);
+  const { state, start, reset } = useUploadPipeline({
+    onComplete: (data) => {
+      // The streaming endpoint wraps the same payload shape as /summarize
+      // inside { event: 'complete', data: {...} } so we can hand the body
+      // straight to the existing app handler.
+      if (data && data.status) {
         onSuccess(data);
       } else {
-        onError(data.message || 'Upload failed');
+        onError((data && data.message) || 'Upload failed');
       }
-    } catch (err: any) {
-      onError(err.message || 'Error processing file');
-    } finally {
-      setLoading(false);
-    }
-  };
+    },
+    onError: (msg) => onError(msg),
+  });
+
+  const handleFileChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!e.target.files?.length) return;
+      const file = e.target.files[0];
+      // Reset the <input> so picking the same file twice still re-fires.
+      e.target.value = '';
+      await start(file);
+    },
+    [start],
+  );
 
   const handleUrlSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const url = (e.currentTarget.elements.namedItem('url') as HTMLInputElement).value;
     if (!url) return;
 
-    setLoading(true);
+    setUrlBusy(true);
     try {
-        const res = await fetch('/api/v1/summarize/url', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({ url })
-        });
-        const data = await res.json();
-        
-        if (data.status) {
-            onSuccess(data);
-        } else {
-            onError(data.message || 'URL processing failed');
-        }
+      const res = await fetch('/api/v1/summarize/url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      if (data.status) {
+        onSuccess(data);
+      } else {
+        onError(data.message || 'URL processing failed');
+      }
     } catch (err: any) {
-        onError(err.message || 'Network error');
+      onError(err.message || 'Network error');
     } finally {
-        setLoading(false);
+      setUrlBusy(false);
     }
-  }
+  };
+
+  const showPipeline = state.active || state.finished;
 
   return (
     <div className="file-uploader">
       <h3>Data Upload</h3>
-      <div className="upload-methods">
-        <div className="upload-method">
+      {!showPipeline && (
+        <div className="upload-methods">
+          <div className="upload-method">
             <label className="button-like">
-                Upload File (CSV, JSON, XLSX, SQLite, .tar, .gz, .tar.gz)
-                <input type="file" onChange={handleFileChange} accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3,.tar,.tgz,.gz" hidden />
+              Upload File (CSV, JSON, XLSX, SQLite, .tar, .gz, .tar.gz)
+              <input
+                type="file"
+                onChange={handleFileChange}
+                accept=".csv,.json,.xlsx,.db,.sqlite,.sqlite3,.tar,.tgz,.gz"
+                hidden
+              />
             </label>
-        </div>
-        <div className="divider">OR</div>
-        <form onSubmit={handleUrlSubmit} className="upload-method url-form">
+          </div>
+          <div className="divider">OR</div>
+          <form onSubmit={handleUrlSubmit} className="upload-method url-form">
             <input type="url" name="url" placeholder="Enter CSV URL..." required />
-            <button type="submit" disabled={loading}>
-                {loading ? 'Processing...' : 'Load from URL'}
+            <button type="submit" disabled={urlBusy}>
+              {urlBusy ? 'Processing...' : 'Load from URL'}
             </button>
-        </form>
-      </div>
-      {loading && <div className="loader">Analyzing data...</div>}
+          </form>
+        </div>
+      )}
+
+      {showPipeline && (
+        <>
+          <PipelineProgress state={state} />
+          {state.finished && (
+            <div className="pipeline-progress__actions">
+              <button type="button" className="secondary" onClick={reset}>
+                Upload another file
+              </button>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 };

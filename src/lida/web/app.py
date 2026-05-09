@@ -1,22 +1,28 @@
+import asyncio
 import gzip
+import json
 import os
 import logging
 import requests
 import shutil
 import tarfile
+import time
 import traceback
 import multiprocessing
 import matplotlib
 
 matplotlib.use("Agg")  # Ensure headless execution
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Callable, Optional
 from fastapi import FastAPI, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from lida.utils import is_gzip_file, is_sqlite_file, is_tar_archive, read_dataframe, read_sqlite_tables
 
-from ..components.litellm_generator import LiteLLMTextGenerator
+from ..components.litellm_generator import LiteLLMTextGenerator, token_sink
 from ..datamodel import (
     GoalWebRequest,
     SummaryUrlRequest,
@@ -84,6 +90,32 @@ else:
 api.mount("/files", StaticFiles(directory=files_static_root, html=True), name="files")
 
 
+# ---------------------------------------------------------------------------
+# Pipeline events
+#
+# Stage names are intentionally a closed set so the frontend stage tracker
+# can render a deterministic 5-step pipeline regardless of which dispatch
+# branch (single-table, sqlite, or tar) the upload takes:
+#
+#   compress   - client-side gzip (frontend-only, server never emits)
+#   upload     - bytes flying over the wire (frontend-only)
+#   decompress - server unpacks .gz wrapper
+#   analyze    - LLM-driven summary + heuristic goals + viz code generation
+#   visualize  - parallel chart execution
+# ---------------------------------------------------------------------------
+
+EmitFn = Callable[[str, dict], None]
+
+
+def _emit(emit: Optional[EmitFn], event: str, **payload: Any) -> None:
+    if emit is None:
+        return
+    try:
+        emit(event, payload)
+    except Exception:
+        logger.debug("emit callback raised; continuing", exc_info=True)
+
+
 def execute_chart_worker(code, data_df, summary, library):
     """Worker function for executing charts in a separate process"""
     # Import locally to avoid pickling issues if global imports are complex,
@@ -98,24 +130,39 @@ def execute_chart_worker(code, data_df, summary, library):
     return executor.execute(code_specs=[code], data=data_df, summary=summary, library=library)
 
 
-def summarize_and_visualize(file_location: str, display_name: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> dict:
+def summarize_and_visualize(
+    file_location: str,
+    display_name: str,
+    textgen_config: TextGenerationConfig,
+    run_visualize: bool,
+    emit: Optional[EmitFn] = None,
+) -> dict:
     """Run the full summarize -> heuristic goals -> parallel chart pipeline for one tabular file.
 
     Returns a dict with summary, data_filename, and (if run_visualize) goals + charts.
+    When ``emit`` is provided, intermediate progress events are pushed through
+    it so the SSE endpoint can stream them; the JSON endpoint passes None and
+    behavior is unchanged.
     """
+    _emit(emit, "summary.started", file_name=display_name)
     summary = lida.summarize(
         data=file_location,
         file_name=display_name,
         summary_method="llm",
         textgen_config=textgen_config,
     )
+    _emit(emit, "summary.ready", file_name=display_name, summary=jsonable_encoder(summary))
     result = {"summary": summary, "data_filename": display_name}
 
     if not run_visualize:
         return result
 
     try:
+        _emit(emit, "goals.started", file_name=display_name)
         goals = lida.goals(summary, n=20, textgen_config=textgen_config, method="heuristic")
+        _emit(emit, "goals.ready", file_name=display_name, goals=jsonable_encoder(goals))
+
+        _emit(emit, "viz.code.started", file_name=display_name, total=len(goals))
         goals_with_code = []
         for i, goal in enumerate(goals):
             code_list = lida.visualize(
@@ -130,23 +177,69 @@ def summarize_and_visualize(file_location: str, display_name: str, textgen_confi
                 goals_with_code.append((i, goal, code_list[0]))
             else:
                 logger.info(f"Failed to generate code for goal {goal.index} (table={display_name})")
+            _emit(
+                emit,
+                "viz.code.progress",
+                file_name=display_name,
+                index=i,
+                total=len(goals),
+                produced=bool(code_list),
+            )
+        _emit(emit, "viz.code.ready", file_name=display_name, count=len(goals_with_code))
 
         charts: list = []
         if goals_with_code:
             data_df = read_dataframe(file_location)
             max_workers = min(len(goals_with_code), os.cpu_count() or 4)
             ctx = multiprocessing.get_context("spawn")
+            _emit(
+                emit,
+                "viz.exec.started",
+                file_name=display_name,
+                workers=max_workers,
+                total=len(goals_with_code),
+            )
             with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
                 future_to_index = {executor.submit(execute_chart_worker, code, data_df, summary, "seaborn"): (i, goal) for i, goal, code in goals_with_code}
                 rendered = []
+                completed = 0
                 for future in as_completed(future_to_index):
                     i, goal = future_to_index[future]
+                    completed += 1
                     try:
                         chart_executed = future.result()
                         if chart_executed:
                             rendered.append((i, chart_executed[0]))
+                            _emit(
+                                emit,
+                                "chart.rendered",
+                                file_name=display_name,
+                                index=i,
+                                completed=completed,
+                                total=len(goals_with_code),
+                                chart=jsonable_encoder(chart_executed[0]),
+                            )
+                        else:
+                            _emit(
+                                emit,
+                                "chart.failed",
+                                file_name=display_name,
+                                index=i,
+                                completed=completed,
+                                total=len(goals_with_code),
+                                error="empty result",
+                            )
                     except Exception as exc:
                         logger.warning(f"Chart exception for goal {goal.index} (table={display_name}): {exc}")
+                        _emit(
+                            emit,
+                            "chart.failed",
+                            file_name=display_name,
+                            index=i,
+                            completed=completed,
+                            total=len(goals_with_code),
+                            error=str(exc),
+                        )
                 rendered.sort(key=lambda x: x[0])
                 charts = [r[1] for r in rendered]
         result["goals"] = goals
@@ -154,6 +247,7 @@ def summarize_and_visualize(file_location: str, display_name: str, textgen_confi
     except Exception as exc:
         logger.error(f"Heuristic flow error for {display_name}: {exc}")
         logger.debug(traceback.format_exc())
+        _emit(emit, "table.error", file_name=display_name, error=str(exc))
     return result
 
 
@@ -417,6 +511,153 @@ async def upload_file(
         return {"status": False, "message": "Error processing file."}
 
 
+@api.post("/summarize/stream")
+async def upload_file_stream(
+    file: UploadFile,
+    visualize: bool = os.environ.get("LIDA_MO_INSTANT_ANALYSIS", "true").lower() == "true",
+):
+    """Streaming variant of /summarize that pushes per-stage progress events.
+
+    Response body is ``text/event-stream``. The frontend reads the response
+    incrementally (XHR readyState=3 or fetch ReadableStream) and renders the
+    pipeline tracker. Events come in two top-level shapes:
+
+    - ``stage`` — one of compress/upload/decompress/analyze/visualize. Always
+      paired (``status: "start"`` then ``status: "done"`` or ``"error"``).
+    - ``payload`` — domain events: ``summary.ready``, ``goals.ready``,
+      ``chart.rendered``, ``llm.token``, etc. The final event is
+      ``{"event": "complete", ...}`` followed by ``{"event": "done"}``.
+    """
+
+    upload_filename = file.filename or "upload.bin"
+    saved_path = os.path.join(data_folder, upload_filename)
+    # Read the body fully before we start streaming the response. FastAPI has
+    # already buffered it; doing this synchronously keeps the upload phase
+    # discrete from the analysis phase the client will see in the tracker.
+    contents = await file.read()
+    with open(saved_path, "wb") as f:
+        f.write(contents)
+
+    return StreamingResponse(
+        _stream_pipeline(saved_path, upload_filename, visualize),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering when proxied
+        },
+    )
+
+
+def _sse_frame(event: str, payload: dict) -> bytes:
+    body = {"event": event, "ts": time.time(), **payload}
+    return f"data: {json.dumps(body, default=str)}\n\n".encode("utf-8")
+
+
+async def _stream_pipeline(saved_path: str, upload_filename: str, visualize: bool):
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    sentinel = object()
+
+    def emit(event: str, payload: dict) -> None:
+        # Worker thread -> async queue. call_soon_threadsafe is required because
+        # the sync pipeline runs in asyncio.to_thread(), not on the event loop.
+        loop.call_soon_threadsafe(queue.put_nowait, (event, payload))
+
+    def run_pipeline() -> None:
+        try:
+            _run_streaming_pipeline(saved_path, upload_filename, visualize, emit)
+        except Exception as exc:
+            logger.error("streaming pipeline crashed: %s", exc, exc_info=True)
+            emit("error", {"message": str(exc)})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+    pipeline_task = asyncio.create_task(asyncio.to_thread(run_pipeline))
+
+    try:
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                yield _sse_frame("done", {})
+                return
+            event, payload = item
+            yield _sse_frame(event, payload)
+    finally:
+        if not pipeline_task.done():
+            pipeline_task.cancel()
+            try:
+                await pipeline_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def _run_streaming_pipeline(
+    saved_path: str,
+    upload_filename: str,
+    visualize: bool,
+    emit: EmitFn,
+) -> None:
+    """Synchronous pipeline body, called inside asyncio.to_thread().
+
+    Emits stage and payload events through ``emit``. token_sink wires LLM token
+    deltas into the same stream as ``llm.token`` events for the active stage.
+    """
+    emit("stage", {"stage": "decompress", "status": "start", "label": "Decompressing"})
+    file_location, display_name = _decompress_if_gzipped(saved_path, upload_filename)
+    emit(
+        "stage",
+        {
+            "stage": "decompress",
+            "status": "done",
+            "display_name": display_name,
+        },
+    )
+
+    textgen_config = TextGenerationConfig(n=1, temperature=0)
+
+    emit("stage", {"stage": "analyze", "status": "start", "label": "Analyzing dataset"})
+
+    token_state = {"count": 0, "started_at": time.time()}
+
+    def on_token(delta: str) -> None:
+        token_state["count"] += 1
+        emit(
+            "llm.token",
+            {
+                "delta": delta,
+                "tokens": token_state["count"],
+                "elapsed_ms": int((time.time() - token_state["started_at"]) * 1000),
+            },
+        )
+
+    try:
+        with token_sink(on_token):
+            entries = _process_uploaded_file(
+                file_location, display_name, textgen_config, visualize, emit=emit
+            )
+    except Exception as exc:
+        emit("stage", {"stage": "analyze", "status": "error", "message": str(exc)})
+        raise
+
+    emit("stage", {"stage": "analyze", "status": "done", "tokens_total": token_state["count"]})
+
+    if not entries:
+        emit("error", {"message": "No tabular data found in upload."})
+        return
+
+    if len(entries) == 1 and "table_name" not in entries[0]:
+        complete_payload = {"status": True, **entries[0]}
+    else:
+        complete_payload = {
+            "status": True,
+            "is_database": True,
+            "data_filename": display_name,
+            "tables": entries,
+        }
+
+    emit("complete", {"data": jsonable_encoder(complete_payload)})
+
+
 def _decompress_if_gzipped(saved_path: str, original_filename: str) -> tuple[str, str]:
     """If the uploaded file is gzip-wrapped (detected by magic bytes), unwrap it.
 
@@ -446,33 +687,63 @@ def _decompress_if_gzipped(saved_path: str, original_filename: str) -> tuple[str
     return inner_path, inner_name
 
 
-def _process_uploaded_file(file_location: str, display_name: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> list:
+def _process_uploaded_file(
+    file_location: str,
+    display_name: str,
+    textgen_config: TextGenerationConfig,
+    run_visualize: bool,
+    emit: Optional[EmitFn] = None,
+) -> list:
     """Dispatch on file kind, returning a flat list of per-dataset result dicts."""
     if is_sqlite_file(file_location):
-        return _sqlite_entries(file_location, display_name, textgen_config, run_visualize)
+        _emit(emit, "dispatch", kind="sqlite", file_name=display_name)
+        return _sqlite_entries(file_location, display_name, textgen_config, run_visualize, emit=emit)
     if is_tar_archive(file_location):
-        return _tar_entries(file_location, display_name, textgen_config, run_visualize)
-    return [summarize_and_visualize(file_location, display_name, textgen_config, run_visualize)]
+        _emit(emit, "dispatch", kind="tar", file_name=display_name)
+        return _tar_entries(file_location, display_name, textgen_config, run_visualize, emit=emit)
+    _emit(emit, "dispatch", kind="single", file_name=display_name)
+    return [summarize_and_visualize(file_location, display_name, textgen_config, run_visualize, emit=emit)]
 
 
-def _sqlite_entries(file_location: str, db_filename: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> list:
+def _sqlite_entries(
+    file_location: str,
+    db_filename: str,
+    textgen_config: TextGenerationConfig,
+    run_visualize: bool,
+    emit: Optional[EmitFn] = None,
+) -> list:
     """Materialize each user table as a CSV, then run the standard pipeline per table."""
     tables = read_sqlite_tables(file_location)
     if not tables:
         return []
+    _emit(
+        emit,
+        "tables.detected",
+        kind="sqlite",
+        count=len(tables),
+        names=list(tables.keys()),
+    )
     stem, _ = os.path.splitext(db_filename)
     results: list = []
     for table_name, df in tables.items():
         csv_filename = f"{stem}__{table_name}.csv"
         csv_path = os.path.join(data_folder, csv_filename)
         df.to_csv(csv_path, index=False)
-        per_table = summarize_and_visualize(csv_path, csv_filename, textgen_config, run_visualize)
+        _emit(emit, "table.started", name=table_name)
+        per_table = summarize_and_visualize(csv_path, csv_filename, textgen_config, run_visualize, emit=emit)
         per_table["table_name"] = table_name
+        _emit(emit, "table.done", name=table_name)
         results.append(per_table)
     return results
 
 
-def _tar_entries(file_location: str, archive_filename: str, textgen_config: TextGenerationConfig, run_visualize: bool) -> list:
+def _tar_entries(
+    file_location: str,
+    archive_filename: str,
+    textgen_config: TextGenerationConfig,
+    run_visualize: bool,
+    emit: Optional[EmitFn] = None,
+) -> list:
     """Extract each regular file from a tar archive and recursively process it.
 
     Sanitizes member names to defeat path traversal and skips directories,
@@ -480,9 +751,11 @@ def _tar_entries(file_location: str, archive_filename: str, textgen_config: Text
     """
     results: list = []
     with tarfile.open(file_location, "r") as tf:
-        for member in tf.getmembers():
-            if not member.isreg():
-                continue
+        members = [m for m in tf.getmembers() if m.isreg()]
+        names = [os.path.basename(m.name) for m in members]
+        names = [n for n in names if n and not n.startswith(".")]
+        _emit(emit, "tables.detected", kind="tar", count=len(names), names=names)
+        for member in members:
             base_name = os.path.basename(member.name)
             if not base_name or base_name.startswith("."):
                 continue
@@ -492,14 +765,19 @@ def _tar_entries(file_location: str, archive_filename: str, textgen_config: Text
                 continue
             with open(dest_path, "wb") as out:
                 shutil.copyfileobj(src, out)
+            _emit(emit, "table.started", name=base_name)
             try:
-                sub_entries = _process_uploaded_file(dest_path, base_name, textgen_config, run_visualize)
+                sub_entries = _process_uploaded_file(
+                    dest_path, base_name, textgen_config, run_visualize, emit=emit
+                )
             except Exception as exc:
                 logger.warning(f"Skipping tar entry {base_name}: {exc}")
+                _emit(emit, "table.error", name=base_name, error=str(exc))
                 continue
             for entry in sub_entries:
                 entry.setdefault("table_name", base_name)
                 results.append(entry)
+            _emit(emit, "table.done", name=base_name)
     return results
 
 
