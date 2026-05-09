@@ -477,7 +477,7 @@ export function useUploadPipeline(options: UploadPipelineOptions = {}) {
       await new Promise<void>((resolve) => {
         const xhr = new XMLHttpRequest();
         xhrRef.current = xhr;
-        xhr.open('POST', `/api/v1/summarize/stream?n_goals=${nGoals}`);
+        xhr.open('POST', `/api/v1/summarize/stream?n_goals=${nGoals}&visualize=true`);
 
         // responseText grows monotonically. We track how much we've already
         // parsed (`consumedTo`) and on each tick drain any complete `data: ...

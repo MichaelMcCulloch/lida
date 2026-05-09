@@ -999,20 +999,24 @@ async def upload_file(
 @api.post("/summarize/stream")
 async def upload_file_stream(
     file: UploadFile,
-    visualize: bool = os.environ.get("LIDA_MO_INSTANT_ANALYSIS", "true").lower() == "true",
+    visualize: bool = True,
     n_goals: int = 5,
 ):
     """Streaming variant of /summarize that pushes per-stage progress events.
 
     Response body is ``text/event-stream``. The frontend reads the response
     incrementally (XHR readyState=3 or fetch ReadableStream) and renders the
-    pipeline tracker. Events come in two top-level shapes:
+    pipeline tracker. Events:
 
-    - ``stage`` — one of compress/upload/decompress/analyze/visualize. Always
-      paired (``status: "start"`` then ``status: "done"`` or ``"error"``).
-    - ``payload`` — domain events: ``summary.ready``, ``goals.ready``,
-      ``chart.rendered``, ``llm.token``, etc. The final event is
-      ``{"event": "complete", ...}`` followed by ``{"event": "done"}``.
+    - ``stage`` — compress/upload/analyze/goals/visualize, paired
+      (``status: "start"`` then ``status: "done"`` or ``"error"``).
+    - ``summary.ready`` (per table), ``goal.ready`` (top-level, with
+      ``data_source``), ``plot.started``/``plot.code.ready``/``chart.rendered``
+      (top-level, keyed by ``goal_index``), ``llm.token`` (with phase tag),
+      ``complete``, ``done``.
+
+    Visualize defaults to True — the slider implies the user wants goals
+    and plots. Pass ``visualize=false`` if you want a summary-only response.
     """
 
     upload_filename = file.filename or "upload.bin"
