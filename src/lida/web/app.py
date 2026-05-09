@@ -532,14 +532,16 @@ def _run_plot_task(
             elapsed_ms=int((time.time() - plot_token_state["started_at"]) * 1000),
         )
 
+    # Call the code generator directly — lida.visualize() does code-gen AND
+    # execution in a single shot, which would double-execute every chart and
+    # also mismatches the type the chart pool expects (str, not response).
     try:
         with token_sink(plot_sink):
-            code_list = lida.visualize(
+            code_list = lida.vizgen.generate(
                 summary=summary,
                 goal=goal,
                 textgen_config=textgen_config,
                 library="seaborn",
-                return_error=True,
             )
     except Exception as exc:
         logger.warning("plot[%d]: LLM call failed: %s", goal_index, exc)
@@ -566,6 +568,9 @@ def _run_plot_task(
         return goal_index, None
 
     chart = chart_executed[0]
+    # Charts that hit a runtime error in the user code are still wrapped in a
+    # ChartExecutorResponse with status=False; emit chart.rendered so the UI
+    # gets the error payload (the slot will render the failure state).
     _emit(
         emit,
         "chart.rendered",
